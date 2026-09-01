@@ -38,6 +38,16 @@ describe('BrowserSessionManager', () => {
     }
   })
 
+  it('leaves the viewport unset in headful mode so the page follows the window', async () => {
+    const manager = new BrowserSessionManager({ headless: false, timeoutMs: 15000 })
+    try {
+      const session = await manager.requireSession({ id: 'a' })
+      await session.navigate(base)
+      expect(session.page.viewportSize()).toBeNull()
+    } finally {
+      await manager.dispose()
+    }
+  })
   it('isolates sessions per agent key', async () => {
     const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
     const keyA = { id: 'a' }

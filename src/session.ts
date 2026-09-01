@@ -201,6 +201,9 @@ export class BrowserSession {
       ...(config.proxy !== undefined ? { proxy: { server: config.proxy, bypass: '<local>,localhost,127.0.0.1,::1' } } : {}),
       args,
       ...(config.executablePath !== undefined ? { executablePath: config.executablePath } : {}),
+      // Headful must not carry a fixed viewport: it locks the page to a
+      // thumbnail size instead of following the window. Headless keeps the default.
+      ...(config.headless ? {} : { viewport: null }),
     }
     if (config.cdpUrl !== undefined) {
       // Attach to an already-running Chrome: reuse its login state and profile.
@@ -220,7 +223,7 @@ export class BrowserSession {
     // cache land under this temp dir instead of the user's real profile.
     const homeDir = mkdtempSync(join(tmpdir(), 'dsh-browser-use-'))
     const browser = await chromium.launch({ ...options, env: { ...process.env, HOME: homeDir } })
-    const context = await browser.newContext()
+    const context = await browser.newContext(config.headless ? {} : { viewport: null })
     const page = await context.newPage()
     return new BrowserSession(browser, context, page, config, homeDir, true)
   }

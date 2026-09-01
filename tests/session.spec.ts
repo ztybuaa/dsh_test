@@ -11,7 +11,9 @@ beforeAll(async () => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
     res.setHeader('content-type', 'text/html; charset=utf-8')
     if (url.pathname === '/') {
-      res.end('<html><head><title>Home</title></head><body><h1>Hello Browser</h1></body></html>')
+      res.end('<html><head><title>Home</title></head><body><h1>Hello Browser</h1><a href="/popup" target="_blank">Open popup</a></body></html>')
+    } else if (url.pathname === '/popup') {
+      res.end('<html><head><title>Popup</title></head><body><h1>Popup page</h1></body></html>')
     } else {
       res.statusCode = 404
       res.end('not found')
@@ -33,6 +35,18 @@ describe('BrowserSessionManager', () => {
       const session = await manager.requireSession(key)
       await session.navigate(base)
       expect(await session.page.title()).toBe('Home')
+    } finally {
+      await manager.dispose()
+    }
+  })
+
+  it('follows a target=_blank popup to the new page', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    try {
+      const session = await manager.requireSession({ id: 'a' })
+      await session.navigate(base)
+      await session.page.click('a[target="_blank"]')
+      await expect.poll(() => session.page.url(), { timeout: 5000 }).toContain('/popup')
     } finally {
       await manager.dispose()
     }

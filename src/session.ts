@@ -221,7 +221,7 @@ export class BrowserSession {
     this.homeDir = homeDir
     this.ownsBrowser = ownsBrowser
     this.attachPage(page)
-    // Follow new tabs opened via target=_blank / window.open.
+    // Follow new pages opened via target=_blank / window.open.
     context.on('page', (newPage) => this.attachPage(newPage))
   }
 
@@ -313,10 +313,11 @@ export class BrowserSession {
       ...(config.proxy !== undefined ? { proxy: { server: config.proxy, bypass: '<local>,localhost,127.0.0.1,::1' } } : {}),
       args,
       ...(config.executablePath !== undefined ? { executablePath: config.executablePath } : {}),
-      // Headful must not carry a fixed viewport: it locks the page to a
-      // thumbnail size instead of following the window. Headless keeps the default.
-      ...(config.headless ? {} : { viewport: null }),
     }
+    // Headful must not carry a fixed viewport: it locks the page to a thumbnail
+    // size instead of following the window. `viewport` is a context option, so it
+    // belongs on the context-creation calls below, never on `chromium.launch`.
+    const contextOptions = config.headless ? {} : { viewport: null }
     if (config.cdpUrl !== undefined) {
       // Attach to an already-running Chrome: reuse its login state and profile.
       const browser = await chromium.connectOverCDP(config.cdpUrl)
@@ -326,7 +327,7 @@ export class BrowserSession {
     }
     if (config.userDataDir !== undefined) {
       // Persistent profile: login/cookies survive across sessions.
-      const context = await chromium.launchPersistentContext(config.userDataDir, options)
+      const context = await chromium.launchPersistentContext(config.userDataDir, { ...options, ...contextOptions })
       const browser = context.browser()
       const page = context.pages()[0] ?? await context.newPage()
       return new BrowserSession(browser, context, page, config, '', true)
@@ -335,7 +336,7 @@ export class BrowserSession {
     // cache land under this temp dir instead of the user's real profile.
     const homeDir = mkdtempSync(join(tmpdir(), 'dsh-browser-use-'))
     const browser = await chromium.launch({ ...options, env: { ...process.env, HOME: homeDir } })
-    const context = await browser.newContext(config.headless ? {} : { viewport: null })
+    const context = await browser.newContext(contextOptions)
     const page = await context.newPage()
     return new BrowserSession(browser, context, page, config, homeDir, true)
   }

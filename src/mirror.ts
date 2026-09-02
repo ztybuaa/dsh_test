@@ -34,6 +34,13 @@ interface InputEvent {
   key?: string
 }
 
+/** Read a JSON request body, bounding it to a sane size. */
+async function readJson<T>(req: IncomingMessage): Promise<T> {
+  const chunks: Buffer[] = []
+  for await (const chunk of req) chunks.push(chunk as Buffer)
+  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as T
+}
+
 /** Register the sidebar-mirror HTTP routes (frame stream + input relay) on the DSH web server. */
 export function registerMirrorRoutes(manager: BrowserSessionManager, webServer: WebServerLike): void {
   const frameSize: FrameSize = { width: 1280, height: 720 }
@@ -74,7 +81,6 @@ async function streamFrames(
   frameSize: FrameSize,
 ): Promise<void> {
   const session = await manager.requireSession()
-  await session.page.goto('https://www.wikipedia.org', { waitUntil: 'load' }).catch(() => {})
 
   res.writeHead(200, {
     'content-type': 'multipart/x-mixed-replace; boundary=frame',
@@ -123,9 +129,7 @@ async function relayInput(
   res: ServerResponse,
   frameSize: FrameSize,
 ): Promise<void> {
-  const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(chunk as Buffer)
-  const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as InputEvent
+  const body = await readJson<InputEvent>(req)
 
   const session = await manager.requireSession()
   if (!session.isTakeover) {
@@ -156,9 +160,7 @@ async function relayInput(
 
 /** Enter/leave human takeover for the default session. */
 async function setTakeover(manager: BrowserSessionManager, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(chunk as Buffer)
-  const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { takeover: boolean }
+  const body = await readJson<{ takeover: boolean }>(req)
 
   const session = await manager.requireSession()
   if (body.takeover === true) session.takeOver()

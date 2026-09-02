@@ -128,7 +128,7 @@ window.__ModuleLoader__.load({
             right: 16,
             top: 16,
             zIndex: 9999,
-            width: 720,
+            width: 900,
             display: 'flex',
             flexDirection: 'column',
             background: 'rgba(20,20,26,0.97)',
@@ -203,7 +203,7 @@ window.__ModuleLoader__.load({
           onMouseLeave: function () {
             hoverRef.current = false
           },
-          style: { width: '100%', display: 'block', background: '#333', cursor: takeover ? 'crosshair' : 'auto' },
+          style: { width: '100%', display: 'block', background: '#333', cursor: 'auto' },
         }),
       )
     }

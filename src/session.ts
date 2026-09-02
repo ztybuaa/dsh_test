@@ -213,8 +213,8 @@ export class BrowserSession {
   private takeoverNotice = false
   /** The previous snapshot's AX nodes, for the backendNodeId diff. `null` = no baseline yet. */
   private lastAxNodes: AxNode[] | null = null
-  /** Pages that already have a JSON-response listener, so switching tabs doesn't double-capture. */
-  private readonly jsonAttached = new WeakSet<Page>()
+  /** Pages that already have response/close listeners, so switching tabs doesn't double-register. */
+  private readonly attached = new WeakSet<Page>()
 
   private constructor(browser: Browser | null, context: BrowserContext, page: Page, config: BrowserConfig, homeDir: string, ownsBrowser: boolean) {
     this.browser = browser
@@ -232,11 +232,19 @@ export class BrowserSession {
     this.page = page
     this.refs.clear()
     this.lastAxNodes = null
-    if (!this.jsonAttached.has(page)) {
-      this.jsonAttached.add(page)
+    if (!this.attached.has(page)) {
+      this.attached.add(page)
       page.on('response', (resp) => this.captureJson(resp))
+      page.on('close', () => this.handlePageClosed(page))
     }
     for (const listener of this.pageListeners) listener(page)
+  }
+
+  /** When the current page closes, fall back to the newest remaining tab so the mirror keeps streaming. */
+  private handlePageClosed(page: Page): void {
+    if (page !== this.page) return
+    const remaining = this.context.pages().filter((p) => !p.isClosed())
+    if (remaining.length > 0) this.attachPage(remaining[remaining.length - 1])
   }
 
   /** Subscribe to page rebinds (e.g. a mirror re-attaching its screencast). Returns a disposer. */

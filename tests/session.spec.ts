@@ -225,6 +225,29 @@ describe('BrowserSessionManager', () => {
     }
   })
 
+  it('falls back to the previous tab when the current page closes', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    try {
+      const session = await manager.requireSession({ id: 'a' })
+      await session.navigate(base)
+      const firstPage = session.page
+
+      // open a target=_blank popup -> the session follows the newest tab
+      await session.page.click('a[target="_blank"]')
+      await expect.poll(() => session.page.url(), { timeout: 5000 }).toContain('/popup')
+      const secondPage = session.page
+      expect(secondPage).not.toBe(firstPage)
+
+      // close the current (popup) tab -> the session must fall back to the original tab
+      await secondPage.close()
+      expect(session.page).toBe(firstPage)
+      expect(session.page.isClosed()).toBe(false)
+      expect(session.page.url()).toContain(base)
+    } finally {
+      await manager.dispose()
+    }
+  })
+
   it('closes one session without touching others, and dispose closes the rest', async () => {
     const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
     const keyA = { id: 'a' }

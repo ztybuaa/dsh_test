@@ -3,6 +3,7 @@ import z from '@deepseek-ai/schemastery'
 import { BrowserSessionManager } from './session.ts'
 import { browserTools } from './tools.ts'
 import { detectProxy } from './proxy.ts'
+import { registerMirrorRoutes, type WebServerLike } from './mirror.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'browser-use'
@@ -79,4 +80,9 @@ export function apply(ctx: Context, config: Config): void {
   for (const tool of browserTools(manager, config.screenshotDir, ctx.attachments)) {
     ctx.tools.register(tool)
   }
+  // Sidebar mirror (web profile only): stream the live page over the web server.
+  ctx.inject(['webServer'], (scope) => {
+    const webServer = (scope as { webServer?: WebServerLike }).webServer
+    if (webServer !== undefined) registerMirrorRoutes(manager, webServer)
+  })
 }

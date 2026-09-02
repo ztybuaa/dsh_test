@@ -157,6 +157,8 @@ export class BrowserSession {
   private refs = new Map<number, Locator>()
   /** JSON API responses the page has loaded (bounded, newest last), exposed to the agent. */
   private readonly jsonResponses: Array<{ url: string; body: unknown }> = []
+  /** Listeners notified whenever the session rebinds to a new page (target=_blank etc.). */
+  private readonly pageListeners: Array<(page: Page) => void> = []
 
   private constructor(browser: Browser | null, context: BrowserContext, page: Page, config: BrowserConfig, homeDir: string, ownsBrowser: boolean) {
     this.browser = browser
@@ -174,6 +176,16 @@ export class BrowserSession {
     this.page = page
     this.refs.clear()
     page.on('response', (resp) => this.captureJson(resp))
+    for (const listener of this.pageListeners) listener(page)
+  }
+
+  /** Subscribe to page rebinds (e.g. a mirror re-attaching its screencast). Returns a disposer. */
+  onPageChange(listener: (page: Page) => void): () => void {
+    this.pageListeners.push(listener)
+    return () => {
+      const i = this.pageListeners.indexOf(listener)
+      if (i >= 0) this.pageListeners.splice(i, 1)
+    }
   }
 
   /** Capture JSON API responses (bounded) as they arrive, so the agent can read page data even when the frontend doesn't render it. */

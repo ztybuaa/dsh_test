@@ -62,6 +62,23 @@ describe('BrowserSessionManager', () => {
       await manager.dispose()
     }
   })
+
+  it('notifies page-change listeners when a popup opens', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    try {
+      const session = await manager.requireSession({ id: 'a' })
+      await session.navigate(base)
+      let notifiedUrl = ''
+      session.onPageChange((page) => {
+        notifiedUrl = page.url()
+      })
+      await session.page.click('a[target="_blank"]')
+      await expect.poll(() => notifiedUrl, { timeout: 5000 }).toContain('/popup')
+    } finally {
+      await manager.dispose()
+    }
+  })
+
   it('isolates sessions per agent key', async () => {
     const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
     const keyA = { id: 'a' }

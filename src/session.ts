@@ -151,7 +151,8 @@ export class BrowserSession {
   private readonly config: BrowserConfig
   private readonly homeDir: string
   private readonly ownsBrowser: boolean
-  readonly page: Page
+  /** The page the session currently drives; follows target=_blank popups to the newest page. */
+  page!: Page
   /** ref (1-based index) -> live locator, captured by the most recent snapshot. */
   private refs = new Map<number, Locator>()
   /** JSON API responses the page has loaded (bounded, newest last), exposed to the agent. */
@@ -160,10 +161,18 @@ export class BrowserSession {
   private constructor(browser: Browser | null, context: BrowserContext, page: Page, config: BrowserConfig, homeDir: string, ownsBrowser: boolean) {
     this.browser = browser
     this.context = context
-    this.page = page
     this.config = config
     this.homeDir = homeDir
     this.ownsBrowser = ownsBrowser
+    this.attachPage(page)
+    // Follow new tabs opened via target=_blank / window.open.
+    context.on('page', (newPage) => this.attachPage(newPage))
+  }
+
+  /** Bind a page as the current one: capture its JSON responses and drop stale refs. */
+  private attachPage(page: Page): void {
+    this.page = page
+    this.refs.clear()
     page.on('response', (resp) => this.captureJson(resp))
   }
 

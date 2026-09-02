@@ -130,8 +130,9 @@ describe('BrowserSessionManager', () => {
 
       session.cede()
       expect(session.isTakeover).toBe(false)
-      // refs were cleared on takeover and not re-snapshot since: the old ref is stale
-      await expect(session.click(ref)).rejects.toThrow(/not in the most recent snapshot/)
+      // refs were cleared on takeover and not re-snapshot since: the old ref is stale,
+      // and the error must tell the agent a human takeover caused it.
+      await expect(session.click(ref)).rejects.toThrow(/human took over/)
 
       // a fresh takeover + snapshot arms (then consumes) the one-shot notice
       session.takeOver()
@@ -179,6 +180,46 @@ describe('BrowserSessionManager', () => {
       expect(manager.liveSessionCount).toBe(1)
 
       off()
+    } finally {
+      await manager.dispose()
+    }
+  })
+
+  it('lists tabs and switches between them', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    try {
+      const session = await manager.requireSession({ id: 'a' })
+      await session.navigate(base)
+      // open a target=_blank popup -> the session follows it to the newest tab
+      await session.page.click('a[target="_blank"]')
+      await expect.poll(() => session.page.url(), { timeout: 5000 }).toContain('/popup')
+
+      const tabs = await session.listPages()
+      expect(tabs.length).toBe(2)
+      expect(tabs[0].url).toContain(base)
+      expect(tabs[1].url).toContain('/popup')
+      expect(tabs[1].current).toBe(true)
+
+      session.switchPage(1)
+      expect(session.page.url()).toContain(base)
+      session.switchPage(2)
+      expect(session.page.url()).toContain('/popup')
+    } finally {
+      await manager.dispose()
+    }
+  })
+
+  it('goes back and forward through history', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    try {
+      const session = await manager.requireSession({ id: 'a' })
+      await session.navigate(base)
+      await session.navigate(`${base}/popup`)
+      expect(await session.page.title()).toBe('Popup')
+      await session.goBack()
+      await expect.poll(() => session.page.title(), { timeout: 5000 }).toBe('Home')
+      await session.goForward()
+      await expect.poll(() => session.page.title(), { timeout: 5000 }).toBe('Popup')
     } finally {
       await manager.dispose()
     }

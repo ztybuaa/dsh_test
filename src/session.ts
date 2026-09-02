@@ -213,6 +213,8 @@ export class BrowserSession {
   private takeoverNotice = false
   /** The previous snapshot's AX nodes, for the backendNodeId diff. `null` = no baseline yet. */
   private lastAxNodes: AxNode[] | null = null
+  /** Pages that already have a JSON-response listener, so switching tabs doesn't double-capture. */
+  private readonly jsonAttached = new WeakSet<Page>()
 
   private constructor(browser: Browser | null, context: BrowserContext, page: Page, config: BrowserConfig, homeDir: string, ownsBrowser: boolean) {
     this.browser = browser
@@ -229,7 +231,11 @@ export class BrowserSession {
   private attachPage(page: Page): void {
     this.page = page
     this.refs.clear()
-    page.on('response', (resp) => this.captureJson(resp))
+    this.lastAxNodes = null
+    if (!this.jsonAttached.has(page)) {
+      this.jsonAttached.add(page)
+      page.on('response', (resp) => this.captureJson(resp))
+    }
     for (const listener of this.pageListeners) listener(page)
   }
 
@@ -275,8 +281,16 @@ export class BrowserSession {
   /** Reject agent writes while the human holds the page. */
   private assertWritable(): void {
     if (this.takeover) {
-      throw new Error('browser-use: human takeover in progress — agent writes are blocked; wait for cede and re-snapshot')
+      throw new Error('browser-use: human takeover in progress — agent writes are blocked; wait for the human to cede, then re-snapshot')
     }
+  }
+
+  /** Error for a stale ref, telling the agent explicitly when a human takeover caused it. */
+  private staleRefError(ref: number): Error {
+    if (this.takeoverNotice) {
+      return new Error(`browser-use: a human took over the browser — ref ${ref} is stale; call browser_snapshot to see the current page state`)
+    }
+    return new Error(`browser-use: ref ${ref} not in the most recent snapshot — the page may have changed; call browser_snapshot first`)
   }
 
   /** Capture JSON API responses (bounded) as they arrive, so the agent can read page data even when the frontend doesn't render it. */
@@ -348,6 +362,46 @@ export class BrowserSession {
     // A navigation is a brand-new page, so drop the diff baseline.
     this.lastAxNodes = null
     await this.page.goto(url, { waitUntil: 'load', timeout: this.config.timeoutMs })
+  }
+
+  /** List every open tab in the context, marking the current one. */
+  async listPages(): Promise<Array<{ index: number; title: string; url: string; current: boolean }>> {
+    const pages = this.context.pages()
+    const out: Array<{ index: number; title: string; url: string; current: boolean }> = []
+    for (let i = 0; i < pages.length; i++) {
+      const p = pages[i]
+      out.push({
+        index: i + 1,
+        title: (await p.title().catch(() => '')).slice(0, 120),
+        url: p.url().slice(0, 300),
+        current: p === this.page,
+      })
+    }
+    return out
+  }
+
+  /** Switch the current page to the tab at `index` (1-based). */
+  switchPage(index: number): void {
+    const pages = this.context.pages()
+    const target = pages[index - 1]
+    if (target === undefined) {
+      throw new Error(`browser-use: tab ${index} does not exist (${pages.length} tab(s) open)`)
+    }
+    this.attachPage(target)
+  }
+
+  /** Go back one step in the current page's history. */
+  async goBack(): Promise<void> {
+    this.refs.clear()
+    this.lastAxNodes = null
+    await this.page.goBack({ waitUntil: 'load', timeout: this.config.timeoutMs })
+  }
+
+  /** Go forward one step in the current page's history. */
+  async goForward(): Promise<void> {
+    this.refs.clear()
+    this.lastAxNodes = null
+    await this.page.goForward({ waitUntil: 'load', timeout: this.config.timeoutMs })
   }
 
   /**
@@ -429,7 +483,7 @@ export class BrowserSession {
     this.assertWritable()
     const locator = this.refs.get(ref)
     if (locator === undefined) {
-      throw new Error(`browser-use: ref ${ref} not in the most recent snapshot — the page may have changed; call browser_snapshot first`)
+      throw this.staleRefError(ref)
     }
     try {
       await locator.click({ timeout: this.config.timeoutMs })
@@ -443,7 +497,7 @@ export class BrowserSession {
     this.assertWritable()
     const locator = this.refs.get(ref)
     if (locator === undefined) {
-      throw new Error(`browser-use: ref ${ref} not in the most recent snapshot — the page may have changed; call browser_snapshot first`)
+      throw this.staleRefError(ref)
     }
     try {
       await locator.fill(text, { timeout: this.config.timeoutMs })
@@ -457,7 +511,7 @@ export class BrowserSession {
     this.assertWritable()
     const locator = this.refs.get(ref)
     if (locator === undefined) {
-      throw new Error(`browser-use: ref ${ref} not in the most recent snapshot — the page may have changed; call browser_snapshot first`)
+      throw this.staleRefError(ref)
     }
     await locator.hover({ timeout: this.config.timeoutMs })
   }
@@ -486,7 +540,7 @@ export class BrowserSession {
     this.assertWritable()
     const locator = this.refs.get(ref)
     if (locator === undefined) {
-      throw new Error(`browser-use: ref ${ref} not in the most recent snapshot — the page may have changed; call browser_snapshot first`)
+      throw this.staleRefError(ref)
     }
     const [download] = await Promise.all([
       this.page.waitForEvent('download', { timeout: this.config.timeoutMs }),

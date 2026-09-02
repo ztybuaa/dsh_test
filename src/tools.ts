@@ -323,6 +323,78 @@ export function browserTools(manager: BrowserSessionManager, screenshotDir: stri
       },
     }),
     defineTool({
+      name: 'browser_tabs',
+      description: 'List every open tab in the browser with its 1-based index, title, and URL. Use before browser_switch_tab to jump back and forth between tabs.',
+      parameters: {},
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            tabs: {
+              type: 'array',
+              required: true,
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  index: { type: 'number', required: true },
+                  title: { type: 'string', required: true },
+                  url: { type: 'string', required: true },
+                  current: { type: 'boolean', required: true },
+                },
+              },
+            },
+          },
+        },
+        render: (_args, value: { tabs: Array<{ index: number; title: string; url: string; current: boolean }> }) => [
+          {
+            type: 'text',
+            text: value.tabs.map((t) => `[${t.index}]${t.current ? ' *' : ''} ${t.title}\n    ${t.url}`).join('\n'),
+          },
+        ],
+      },
+      async execute(_args, exec) {
+        const session = await manager.requireSession(exec.agent)
+        return { tabs: await session.listPages() }
+      },
+    }),
+    defineTool({
+      name: 'browser_switch_tab',
+      description: 'Switch the current page to the tab at `index` (1-based, from browser_tabs).',
+      parameters: {
+        index: { type: 'number', required: true, description: 'The 1-based tab index to switch to' },
+      },
+      output: { schema: okSchema, render: renderOk },
+      async execute(args, exec) {
+        const session = await manager.requireSession(exec.agent)
+        session.switchPage(args.index)
+        return { ok: true, message: `switched to tab ${args.index}` }
+      },
+    }),
+    defineTool({
+      name: 'browser_go_back',
+      description: 'Go back one step in the current page\'s history.',
+      parameters: {},
+      output: { schema: okSchema, render: renderOk },
+      async execute(_args, exec) {
+        const session = await manager.requireSession(exec.agent)
+        await session.goBack()
+        return { ok: true, message: 'went back' }
+      },
+    }),
+    defineTool({
+      name: 'browser_go_forward',
+      description: 'Go forward one step in the current page\'s history.',
+      parameters: {},
+      output: { schema: okSchema, render: renderOk },
+      async execute(_args, exec) {
+        const session = await manager.requireSession(exec.agent)
+        await session.goForward()
+        return { ok: true, message: 'went forward' }
+      },
+    }),
+    defineTool({
       name: 'browser_close',
       description: 'Close the current browser session and release its resources. A later browser tool starts a fresh session.',
       parameters: {},

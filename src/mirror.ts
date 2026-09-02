@@ -55,6 +55,15 @@ export function registerMirrorRoutes(manager: BrowserSessionManager, webServer: 
       void relayInput(manager, req, res, frameSize)
     },
   })
+
+  webServer.register({
+    name: 'browser-use-takeover',
+    kind: 'exact',
+    path: '/browser-use/takeover',
+    handler: (req, res) => {
+      void setTakeover(manager, req, res)
+    },
+  })
 }
 
 /** Stream the session's current page as MJPEG, following target=_blank page rebinds. */
@@ -119,6 +128,11 @@ async function relayInput(
   const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as InputEvent
 
   const session = await manager.requireSession()
+  if (!session.isTakeover) {
+    res.writeHead(409, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: 'not in takeover — click 接管浏览器 first' }))
+    return
+  }
   const mx = typeof body.x === 'number' ? body.x * frameSize.width : undefined
   const my = typeof body.y === 'number' ? body.y * frameSize.height : undefined
 
@@ -138,4 +152,18 @@ async function relayInput(
 
   res.writeHead(200, { 'content-type': 'application/json' })
   res.end(JSON.stringify({ ok: true }))
+}
+
+/** Enter/leave human takeover for the default session. */
+async function setTakeover(manager: BrowserSessionManager, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const chunks: Buffer[] = []
+  for await (const chunk of req) chunks.push(chunk as Buffer)
+  const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { takeover: boolean }
+
+  const session = await manager.requireSession()
+  if (body.takeover === true) session.takeOver()
+  else session.cede()
+
+  res.writeHead(200, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ ok: true, takeover: session.isTakeover }))
 }

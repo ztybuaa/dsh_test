@@ -159,6 +159,12 @@ export class BrowserSession {
   private readonly jsonResponses: Array<{ url: string; body: unknown }> = []
   /** Listeners notified whenever the session rebinds to a new page (target=_blank etc.). */
   private readonly pageListeners: Array<(page: Page) => void> = []
+  /** Whether the human has taken over this session via the mirror. */
+  private takeover = false
+  /** Monotonic epoch, bumped on takeover so stale snapshots/refs are rejected. */
+  private epoch = 0
+  /** One-shot takeover notice armed by takeOver(), consumed by the next snapshot. */
+  private takeoverNotice = false
 
   private constructor(browser: Browser | null, context: BrowserContext, page: Page, config: BrowserConfig, homeDir: string, ownsBrowser: boolean) {
     this.browser = browser
@@ -185,6 +191,43 @@ export class BrowserSession {
     return () => {
       const i = this.pageListeners.indexOf(listener)
       if (i >= 0) this.pageListeners.splice(i, 1)
+    }
+  }
+
+  /** Whether the human currently owns the page (mirror takeover). */
+  get isTakeover(): boolean {
+    return this.takeover
+  }
+
+  /** The current takeover epoch (bumped each takeover). */
+  get currentEpoch(): number {
+    return this.epoch
+  }
+
+  /** Human takes over: bump epoch, clear refs, arm the one-shot notice. */
+  takeOver(): void {
+    this.takeover = true
+    this.epoch += 1
+    this.refs.clear()
+    this.takeoverNotice = true
+  }
+
+  /** Human cedes: agent may resume, but must re-snapshot (refs stay cleared). */
+  cede(): void {
+    this.takeover = false
+  }
+
+  /** Consume the one-shot takeover notice. */
+  takeTakeoverNotice(): boolean {
+    const n = this.takeoverNotice
+    this.takeoverNotice = false
+    return n
+  }
+
+  /** Reject agent writes while the human holds the page. */
+  private assertWritable(): void {
+    if (this.takeover) {
+      throw new Error('browser-use: human takeover in progress — agent writes are blocked; wait for cede and re-snapshot')
     }
   }
 
@@ -278,11 +321,13 @@ export class BrowserSession {
       refs.set(ref, locator.nth(i))
     }
     this.refs = refs
-    return { title, url, elements, ...(truncated ? { truncated: true } : {}) }
+    const intervened = this.takeTakeoverNotice()
+    return { title, url, elements, ...(truncated ? { truncated: true } : {}), ...(intervened ? { notice: 'human took over — this snapshot reflects the current page state' } : {}) }
   }
 
   /** Click the element addressed by `ref` from the most recent snapshot. */
   async click(ref: number): Promise<void> {
+    this.assertWritable()
     const locator = this.refs.get(ref)
     if (locator === undefined) {
       throw new Error(`browser-use: ref ${ref} not in the most recent snapshot — the page may have changed; call browser_snapshot first`)
@@ -296,6 +341,7 @@ export class BrowserSession {
 
   /** Type text into the input addressed by `ref` from the most recent snapshot. */
   async type(ref: number, text: string): Promise<void> {
+    this.assertWritable()
     const locator = this.refs.get(ref)
     if (locator === undefined) {
       throw new Error(`browser-use: ref ${ref} not in the most recent snapshot — the page may have changed; call browser_snapshot first`)
@@ -309,6 +355,7 @@ export class BrowserSession {
 
   /** Hover the element addressed by `ref` from the most recent snapshot. */
   async hover(ref: number): Promise<void> {
+    this.assertWritable()
     const locator = this.refs.get(ref)
     if (locator === undefined) {
       throw new Error(`browser-use: ref ${ref} not in the most recent snapshot — the page may have changed; call browser_snapshot first`)
@@ -337,6 +384,7 @@ export class BrowserSession {
 
   /** Click `ref`, capture the triggered download, save it under `dir`, and preview its content. */
   async download(ref: number, dir: string): Promise<{ path: string; preview: string }> {
+    this.assertWritable()
     const locator = this.refs.get(ref)
     if (locator === undefined) {
       throw new Error(`browser-use: ref ${ref} not in the most recent snapshot — the page may have changed; call browser_snapshot first`)
@@ -359,6 +407,7 @@ export class BrowserSession {
 
   /** Scroll the page by a pixel amount in the given direction. */
   async scroll(direction: 'up' | 'down', amount: number): Promise<void> {
+    this.assertWritable()
     const delta = direction === 'down' ? amount : -amount
     await this.page.evaluate((n) => window.scrollBy(0, n), delta)
   }
@@ -391,6 +440,7 @@ export class BrowserSession {
 
   /** Press a keyboard key on the focused element (e.g. Enter, Escape, Tab). */
   async pressKey(key: string): Promise<void> {
+    this.assertWritable()
     await this.page.keyboard.press(key)
   }
 

@@ -79,6 +79,34 @@ describe('BrowserSessionManager', () => {
     }
   })
 
+  it('blocks agent writes during takeover, clears refs on cede, and arms a one-shot notice', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    try {
+      const session = await manager.requireSession({ id: 'a' })
+      await session.navigate(base)
+      const snap = await session.snapshot()
+      const ref = snap.elements[0].ref
+
+      session.takeOver()
+      expect(session.isTakeover).toBe(true)
+      expect(session.currentEpoch).toBe(1)
+      await expect(session.click(ref)).rejects.toThrow(/takeover/)
+
+      session.cede()
+      expect(session.isTakeover).toBe(false)
+      // refs were cleared on takeover and not re-snapshot since: the old ref is stale
+      await expect(session.click(ref)).rejects.toThrow(/not in the most recent snapshot/)
+
+      // a fresh takeover + snapshot arms (then consumes) the one-shot notice
+      session.takeOver()
+      const afterTakeover = await session.snapshot()
+      expect(afterTakeover.notice).toContain('took over')
+      expect((await session.snapshot()).notice).toBeUndefined()
+    } finally {
+      await manager.dispose()
+    }
+  })
+
   it('isolates sessions per agent key', async () => {
     const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
     const keyA = { id: 'a' }

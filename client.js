@@ -1,6 +1,6 @@
 // Browser half of the dsh-browser-use plugin: the sidebar mirror.
-// A floating 16:9 panel streams the host MJPEG screencast and relays the full
-// mouse model (down/move/up = click + drag + hover) + wheel + keyboard.
+// A floating 16:9 panel streams the host MJPEG screencast. Input is gated by an
+// explicit takeover: click 「接管浏览器」 to drive the page, 「交还浏览器」 to hand it back.
 window.__ModuleLoader__.load({
   id: 'dsh-browser-use',
   factory: (require) => {
@@ -21,6 +21,9 @@ window.__ModuleLoader__.load({
       var openState = react.useState(true)
       var open = openState[0]
       var setOpen = openState[1]
+      var takeoverState = react.useState(false)
+      var takeover = takeoverState[0]
+      var setTakeover = takeoverState[1]
       var imgRef = react.useRef(null)
       var hoverRef = react.useRef(false)
       var lastMoveRef = react.useRef(0)
@@ -30,10 +33,24 @@ window.__ModuleLoader__.load({
         return { x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height }
       }
 
+      function toggleTakeover() {
+        var next = !takeover
+        fetch('/browser-use/takeover', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ takeover: next }),
+        })
+          .then(function () {
+            setTakeover(next)
+          })
+          .catch(function () {})
+      }
+
       react.useEffect(function () {
         var el = imgRef.current
         if (!el) return
         function onWheel(e) {
+          if (!takeover) return
           e.preventDefault()
           postInput({ type: 'scroll', deltaY: e.deltaY })
         }
@@ -41,11 +58,11 @@ window.__ModuleLoader__.load({
         return function () {
           el.removeEventListener('wheel', onWheel)
         }
-      }, [open])
+      }, [open, takeover])
 
       react.useEffect(function () {
         function onKeyDown(e) {
-          if (!hoverRef.current) return
+          if (!takeover || !hoverRef.current) return
           if (['Shift', 'Control', 'Alt', 'Meta'].indexOf(e.key) >= 0) return
           postInput({ type: 'key', key: e.key })
         }
@@ -53,13 +70,15 @@ window.__ModuleLoader__.load({
         return function () {
           document.removeEventListener('keydown', onKeyDown)
         }
-      }, [])
+      }, [takeover])
 
       var onMouseDown = function (e) {
+        if (!takeover) return
         var p = norm(e)
         postInput({ type: 'down', x: p.x, y: p.y })
       }
       var onMouseMove = function (e) {
+        if (!takeover) return
         var now = Date.now()
         if (now - lastMoveRef.current < 30) return
         lastMoveRef.current = now
@@ -67,6 +86,7 @@ window.__ModuleLoader__.load({
         postInput({ type: 'move', x: p.x, y: p.y })
       }
       var onMouseUp = function (e) {
+        if (!takeover) return
         var p = norm(e)
         postInput({ type: 'up', x: p.x, y: p.y })
       }
@@ -117,6 +137,7 @@ window.__ModuleLoader__.load({
             borderRadius: 12,
             overflow: 'hidden',
             boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
+            border: takeover ? '2px solid #f0b429' : '2px solid transparent',
           },
         },
         h(
@@ -130,24 +151,44 @@ window.__ModuleLoader__.load({
               borderBottom: '1px solid rgba(255,255,255,0.1)',
             },
           },
-          h('span', { style: { fontWeight: 600 } }, 'browser-use mirror'),
+          h('span', { style: { fontWeight: 600 } }, takeover ? '人接管中' : 'browser-use mirror'),
           h(
-            'button',
-            {
-              onClick: function () {
-                setOpen(false)
+            'div',
+            { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+            h(
+              'button',
+              {
+                onClick: toggleTakeover,
+                style: {
+                  border: '1px solid rgba(255,255,255,0.25)',
+                  background: takeover ? '#f0b429' : 'transparent',
+                  color: takeover ? '#1a1a1a' : '#eee',
+                  cursor: 'pointer',
+                  fontSize: '12px',
+                  padding: '4px 10px',
+                  borderRadius: 6,
+                },
               },
-              'aria-label': 'close browser mirror',
-              style: {
-                border: 'none',
-                background: 'none',
-                color: '#ccc',
-                cursor: 'pointer',
-                fontSize: '14px',
-                padding: '2px 6px',
+              takeover ? '交还浏览器' : '接管浏览器',
+            ),
+            h(
+              'button',
+              {
+                onClick: function () {
+                  setOpen(false)
+                },
+                'aria-label': 'close browser mirror',
+                style: {
+                  border: 'none',
+                  background: 'none',
+                  color: '#ccc',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                  padding: '2px 6px',
+                },
               },
-            },
-            '✕',
+              '✕',
+            ),
           ),
         ),
         h('img', {
@@ -162,7 +203,7 @@ window.__ModuleLoader__.load({
           onMouseLeave: function () {
             hoverRef.current = false
           },
-          style: { width: '100%', display: 'block', background: '#333', cursor: 'auto' },
+          style: { width: '100%', display: 'block', background: '#333', cursor: takeover ? 'crosshair' : 'auto' },
         }),
       )
     }

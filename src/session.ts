@@ -597,9 +597,10 @@ export class BrowserSession {
     await this.page.keyboard.press(key)
   }
 
-  /** Whether the underlying browser is still connected. */
+  /** Whether the underlying browser is still connected and the page not closed. */
   isAlive(): boolean {
-    return this.browser?.isConnected() ?? false
+    if (!this.browser?.isConnected()) return false
+    return !this.page.isClosed()
   }
 
   /** Close the browser and release its resources. */

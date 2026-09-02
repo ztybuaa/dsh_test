@@ -261,4 +261,21 @@ describe('BrowserSessionManager', () => {
       await manager.dispose()
     }
   })
+
+  it('recreates the session when the page is closed but the browser stays connected', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    const key = { id: 'a' }
+    try {
+      const s1 = await manager.requireSession(key)
+      await s1.navigate(base)
+      await s1.page.close() // close only the tab; the browser process stays alive
+      expect(s1.isAlive()).toBe(false)
+      const s2 = await manager.requireSession(key)
+      expect(s2).not.toBe(s1)
+      await s2.navigate(base)
+      expect(await s2.page.title()).toBe('Home')
+    } finally {
+      await manager.dispose()
+    }
+  })
 })

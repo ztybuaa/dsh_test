@@ -438,6 +438,18 @@ export class BrowserSession {
     this.attachPage(target)
   }
 
+  /** 1-based index of the page that is currently visible (foreground tab), or undefined if none. */
+  async activePageIndex(): Promise<number | undefined> {
+    const pages = this.context.pages()
+    for (let i = 0; i < pages.length; i++) {
+      const p = pages[i]
+      if (p.isClosed()) continue
+      const vis = await p.evaluate(() => document.visibilityState).catch(() => 'hidden')
+      if (vis === 'visible') return i + 1
+    }
+    return undefined
+  }
+
   /** Go back one step in the current page's history. */
   async goBack(): Promise<void> {
     this.refs.clear()

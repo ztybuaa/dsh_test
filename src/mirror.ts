@@ -86,7 +86,7 @@ async function streamFrames(
   let disposePage: (() => void) | undefined
   let closed = false
 
-  const attach = async (page: Page): Promise<void> => {
+  const attach = async (page: Page, session: BrowserSession): Promise<void> => {
     if (closed) return
     if (cdp !== undefined) {
       cdp.send('Page.stopScreencast').catch(() => {})
@@ -105,6 +105,18 @@ async function streamFrames(
       res.write(buf)
       res.write('\r\n')
     })
+    // When the streamed page goes to the background (the human switched tabs in
+    // the real browser), re-point the session at the now-visible tab. That fires
+    // onPageChange, which re-attaches the screencast to the right page.
+    cdp.on('Page.screencastVisibilityChanged', (ev: { visible: boolean }) => {
+      if (ev.visible || closed) return
+      void session
+        .activePageIndex()
+        .then((idx) => {
+          if (idx !== undefined && !closed) session.switchPage(idx)
+        })
+        .catch(() => {})
+    })
     // Downscale to the mirror panel's size (the client <img> is ~1000px wide);
     // full-resolution frames are the main source of encode/transport latency.
     await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 70, everyNthFrame: 1, maxWidth: 1280, maxHeight: 720 })
@@ -113,8 +125,8 @@ async function streamFrames(
   const follow = (session: BrowserSession): void => {
     if (closed) return
     disposePage?.()
-    disposePage = session.onPageChange((page) => void attach(page))
-    void attach(session.page)
+    disposePage = session.onPageChange((page) => void attach(page, session))
+    void attach(session.page, session)
   }
 
   // Mirror the agent's session; while none exists, hold the stream open (the

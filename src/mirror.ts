@@ -96,15 +96,18 @@ async function streamFrames(
     cdp = await page.context().newCDPSession(page)
     cdp.on('Page.screencastFrame', (raw) => {
       const frame = raw as unknown as ScreencastFrame
+      // Ack first so Chrome's flow control never throttles the next frame.
+      cdp?.send('Page.screencastFrameAck', { sessionId: frame.sessionId }).catch(() => {})
       frameSize.width = frame.metadata.deviceWidth
       frameSize.height = frame.metadata.deviceHeight
       const buf = Buffer.from(frame.data, 'base64')
       res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${buf.length}\r\n\r\n`)
       res.write(buf)
       res.write('\r\n')
-      cdp?.send('Page.screencastFrameAck', { sessionId: frame.sessionId }).catch(() => {})
     })
-    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 80, everyNthFrame: 1 })
+    // Downscale to the mirror panel's size (the client <img> is ~1000px wide);
+    // full-resolution frames are the main source of encode/transport latency.
+    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 70, everyNthFrame: 1, maxWidth: 1280, maxHeight: 720 })
   }
 
   const follow = (session: BrowserSession): void => {

@@ -1,5 +1,6 @@
 // Browser half of the dsh-browser-use plugin: the sidebar mirror.
-// A floating 16:9 panel streams the host MJPEG screencast (read-only in Iter 1).
+// A floating 16:9 panel streams the host MJPEG screencast and relays the full
+// mouse model (down/move/up = click + drag + hover) + wheel + keyboard.
 window.__ModuleLoader__.load({
   id: 'dsh-browser-use',
   factory: (require) => {
@@ -7,11 +8,68 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     var react = require('react')
 
+    function postInput(payload) {
+      fetch('/browser-use/input', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      }).catch(function () {})
+    }
+
     function BrowserPanel() {
       var h = react.createElement
       var openState = react.useState(true)
       var open = openState[0]
       var setOpen = openState[1]
+      var imgRef = react.useRef(null)
+      var hoverRef = react.useRef(false)
+      var lastMoveRef = react.useRef(0)
+
+      function norm(e) {
+        var rect = imgRef.current.getBoundingClientRect()
+        return { x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height }
+      }
+
+      react.useEffect(function () {
+        var el = imgRef.current
+        if (!el) return
+        function onWheel(e) {
+          e.preventDefault()
+          postInput({ type: 'scroll', deltaY: e.deltaY })
+        }
+        el.addEventListener('wheel', onWheel, { passive: false })
+        return function () {
+          el.removeEventListener('wheel', onWheel)
+        }
+      }, [open])
+
+      react.useEffect(function () {
+        function onKeyDown(e) {
+          if (!hoverRef.current) return
+          if (['Shift', 'Control', 'Alt', 'Meta'].indexOf(e.key) >= 0) return
+          postInput({ type: 'key', key: e.key })
+        }
+        document.addEventListener('keydown', onKeyDown)
+        return function () {
+          document.removeEventListener('keydown', onKeyDown)
+        }
+      }, [])
+
+      var onMouseDown = function (e) {
+        var p = norm(e)
+        postInput({ type: 'down', x: p.x, y: p.y })
+      }
+      var onMouseMove = function (e) {
+        var now = Date.now()
+        if (now - lastMoveRef.current < 30) return
+        lastMoveRef.current = now
+        var p = norm(e)
+        postInput({ type: 'move', x: p.x, y: p.y })
+      }
+      var onMouseUp = function (e) {
+        var p = norm(e)
+        postInput({ type: 'up', x: p.x, y: p.y })
+      }
 
       if (!open) {
         return h(
@@ -93,8 +151,18 @@ window.__ModuleLoader__.load({
           ),
         ),
         h('img', {
+          ref: imgRef,
           src: '/browser-use/frame-stream',
-          style: { width: '100%', display: 'block', background: '#333' },
+          onMouseDown: onMouseDown,
+          onMouseMove: onMouseMove,
+          onMouseUp: onMouseUp,
+          onMouseEnter: function () {
+            hoverRef.current = true
+          },
+          onMouseLeave: function () {
+            hoverRef.current = false
+          },
+          style: { width: '100%', display: 'block', background: '#333', cursor: 'auto' },
         }),
       )
     }

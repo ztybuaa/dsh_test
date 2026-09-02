@@ -12,8 +12,8 @@ export interface WebServerLike {
   }): unknown
 }
 
-/** The most recent screencast frame's device size, shared with the input relay. */
-export interface FrameSize {
+/** The most recent screencast frame's device size, used to scale relayed coordinates. */
+interface FrameSize {
   width: number
   height: number
 }
@@ -25,8 +25,17 @@ interface ScreencastFrame {
   metadata: { deviceWidth: number; deviceHeight: number }
 }
 
-/** Register the sidebar-mirror HTTP routes on the DSH web server. */
-export function registerMirrorRoutes(manager: BrowserSessionManager, webServer: WebServerLike): FrameSize {
+/** One relayed input event posted by the client panel. */
+interface InputEvent {
+  type: 'down' | 'move' | 'up' | 'scroll' | 'key'
+  x?: number
+  y?: number
+  deltaY?: number
+  key?: string
+}
+
+/** Register the sidebar-mirror HTTP routes (frame stream + input relay) on the DSH web server. */
+export function registerMirrorRoutes(manager: BrowserSessionManager, webServer: WebServerLike): void {
   const frameSize: FrameSize = { width: 1280, height: 720 }
 
   webServer.register({
@@ -38,7 +47,14 @@ export function registerMirrorRoutes(manager: BrowserSessionManager, webServer: 
     },
   })
 
-  return frameSize
+  webServer.register({
+    name: 'browser-use-input',
+    kind: 'exact',
+    path: '/browser-use/input',
+    handler: (req, res) => {
+      void relayInput(manager, req, res, frameSize)
+    },
+  })
 }
 
 /** Stream the session's current page as MJPEG, following target=_blank page rebinds. */
@@ -89,4 +105,37 @@ async function streamFrames(
     offPage()
     cdp?.send('Page.stopScreencast').catch(() => {})
   })
+}
+
+/** Relay one client input event back onto the shared page, scaling normalized coords to device pixels. */
+async function relayInput(
+  manager: BrowserSessionManager,
+  req: IncomingMessage,
+  res: ServerResponse,
+  frameSize: FrameSize,
+): Promise<void> {
+  const chunks: Buffer[] = []
+  for await (const chunk of req) chunks.push(chunk as Buffer)
+  const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as InputEvent
+
+  const session = await manager.requireSession()
+  const mx = typeof body.x === 'number' ? body.x * frameSize.width : undefined
+  const my = typeof body.y === 'number' ? body.y * frameSize.height : undefined
+
+  if (body.type === 'down' && mx !== undefined && my !== undefined) {
+    await session.page.mouse.move(mx, my)
+    await session.page.mouse.down()
+  } else if (body.type === 'move' && mx !== undefined && my !== undefined) {
+    await session.page.mouse.move(mx, my)
+  } else if (body.type === 'up' && mx !== undefined && my !== undefined) {
+    await session.page.mouse.move(mx, my)
+    await session.page.mouse.up()
+  } else if (body.type === 'scroll' && typeof body.deltaY === 'number') {
+    await session.page.mouse.wheel(0, body.deltaY)
+  } else if (body.type === 'key' && typeof body.key === 'string') {
+    await session.page.keyboard.press(body.key)
+  }
+
+  res.writeHead(200, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ ok: true }))
 }

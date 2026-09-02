@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { BrowserSessionManager, diffElements } from '../src/session.ts'
+import { BrowserSessionManager, diffAxNodes } from '../src/session.ts'
 
 let server: Server
 let base: string
@@ -27,11 +27,17 @@ afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()))
 })
 
-describe('diffElements', () => {
-  it('reports elements that appeared or disappeared by role+name', () => {
-    expect(diffElements([], [{ ref: 1, role: 'link', name: 'About' }])).toEqual({ added: ['link "About"'], removed: [] })
-    expect(diffElements([{ ref: 1, role: 'link', name: 'About' }], [])).toEqual({ added: [], removed: ['link "About"'] })
-    expect(diffElements([{ ref: 1, role: 'link', name: 'About' }], [{ ref: 1, role: 'link', name: 'About' }])).toEqual({ added: [], removed: [] })
+describe('diffAxNodes', () => {
+  const a = { key: '1', role: 'link', name: 'About' }
+  const b = { key: '2', role: 'button', name: 'Go' }
+
+  it('reports added/deleted/changed keyed by the stable backendNodeId handle', () => {
+    expect(diffAxNodes([], [a])).toEqual({ added: ['link "About"'], deleted: [], changed: [] })
+    expect(diffAxNodes([a], [])).toEqual({ added: [], deleted: ['link "About"'], changed: [] })
+    expect(diffAxNodes([a], [a])).toEqual({ added: [], deleted: [], changed: [] })
+    expect(diffAxNodes([a], [{ ...a, name: 'About us' }])).toEqual({ added: [], deleted: [], changed: ['link "About us"'] })
+    // same label but a different handle is still a remove+add, not a no-op
+    expect(diffAxNodes([a], [b])).toEqual({ added: ['button "Go"'], deleted: ['link "About"'], changed: [] })
   })
 })
 
@@ -87,7 +93,7 @@ describe('BrowserSessionManager', () => {
     }
   })
 
-  it('reports a coarse added/removed diff across snapshots', async () => {
+  it('reports a backendNodeId added/deleted diff across snapshots', async () => {
     const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
     try {
       const session = await manager.requireSession({ id: 'a' })

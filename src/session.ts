@@ -1,4 +1,4 @@
-import { chromium, type Browser, type BrowserContext, type Locator, type Page, type Response } from 'playwright'
+import { chromium, type Browser, type BrowserContext, type CDPSession, type Locator, type Page, type Response } from 'playwright'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -45,30 +45,44 @@ export interface PageSnapshot {
   truncated?: boolean
   /** One-shot notice about the session (e.g. "recreated after a crash"). */
   notice?: string
-  /** Coarse added/removed diff vs the previous snapshot (keyed by role+name). */
+  /** Diff vs the previous snapshot, keyed by the stable `backendNodeId` handle (see #24). */
   changes?: SnapshotChanges
 }
 
-/** Elements that appeared / disappeared between two consecutive snapshots. */
+/** Elements that appeared / disappeared / changed between two consecutive snapshots. */
 export interface SnapshotChanges {
   added: string[]
-  removed: string[]
+  deleted: string[]
+  changed: string[]
+}
+
+/** One interactive node from `Accessibility.getFullAXTree`, carrying its stable backend handle. */
+export interface AxNode {
+  /** Stable handle: `frameId` + `backendNodeId`, so cross-iframe nodes don't collide. */
+  key: string
+  role: string
+  name: string
+  state?: string
 }
 
 /**
- * Diff two element lists by role+name. This is a coarse content diff: a
- * stable `backendNodeId` handle (per #24) would be more precise, but requires
- * switching the snapshot source to `Accessibility.getFullAXTree`. Kept light
- * so the model still gets a "what changed" summary after a human cedes.
+ * Diff two AX trees by `backendNodeId` (per #24): a node is `added`/`deleted`
+ * when its stable handle appears/disappears, and `changed` when the same node
+ * keeps its handle but its role/name/state shifted. Labels are `role "name"`.
  */
-export function diffElements(prev: SnapshotElement[], next: SnapshotElement[]): SnapshotChanges {
-  const key = (e: SnapshotElement) => `${e.role}\u0000${e.name}`
-  const prevKeys = new Set(prev.map(key))
-  const nextKeys = new Set(next.map(key))
-  const label = (e: SnapshotElement) => `${e.role} "${e.name}"`
-  const added = next.filter((e) => !prevKeys.has(key(e))).map(label)
-  const removed = prev.filter((e) => !nextKeys.has(key(e))).map(label)
-  return { added, removed }
+export function diffAxNodes(prev: AxNode[], next: AxNode[]): SnapshotChanges {
+  const prevMap = new Map(prev.map((n) => [n.key, n]))
+  const nextMap = new Map(next.map((n) => [n.key, n]))
+  const label = (n: AxNode) => `${n.role} "${n.name}"`
+  const added = next.filter((n) => !prevMap.has(n.key)).map(label)
+  const deleted = prev.filter((n) => !nextMap.has(n.key)).map(label)
+  const changed = next
+    .filter((n) => {
+      const p = prevMap.get(n.key)
+      return p !== undefined && (p.role !== n.role || p.name !== n.name || (p.state ?? '') !== (n.state ?? ''))
+    })
+    .map(label)
+  return { added, deleted, changed }
 }
 
 /** Truncate text at a character cap without splitting a surrogate pair. */
@@ -101,6 +115,8 @@ const INTERACTIVE_ROLES = [
   'menuitem', 'menuitemcheckbox', 'menuitemradio', 'checkbox', 'radio',
   'switch', 'searchbox', 'slider', 'spinbutton', 'treeitem',
 ] as const
+/** Same roles as a Set, for filtering `getFullAXTree` down to interactive nodes. */
+const INTERACTIVE_ROLE_SET = new Set<string>(INTERACTIVE_ROLES)
 const TAG_SELECTOR = 'a[href]:visible, button:visible, input:visible, select:visible, textarea:visible, [contenteditable="true"]:visible'
 const ROLE_SELECTOR = INTERACTIVE_ROLES.map((r) => `[role="${r}"]:visible`).join(', ')
 const SNAPSHOT_SELECTOR = `${TAG_SELECTOR}, ${ROLE_SELECTOR}`
@@ -161,10 +177,11 @@ export function formatSnapshot(snapshot: PageSnapshot): string {
   }
   if (snapshot.elements.length === 0) lines.push('(none)')
   if (snapshot.truncated) lines.push(`(snapshot truncated at ${snapshot.elements.length} elements — call browser_extract for full content)`)
-  if (snapshot.changes && (snapshot.changes.added.length > 0 || snapshot.changes.removed.length > 0)) {
+  if (snapshot.changes && (snapshot.changes.added.length > 0 || snapshot.changes.deleted.length > 0 || snapshot.changes.changed.length > 0)) {
     lines.push('', 'Changes since last snapshot:')
     for (const added of snapshot.changes.added) lines.push(`  + ${added}`)
-    for (const removed of snapshot.changes.removed) lines.push(`  - ${removed}`)
+    for (const deleted of snapshot.changes.deleted) lines.push(`  - ${deleted}`)
+    for (const changed of snapshot.changes.changed) lines.push(`  ~ ${changed}`)
   }
   if (snapshot.notice) lines.unshift(`Notice: ${snapshot.notice}`)
   return lines.join('\n')
@@ -194,8 +211,8 @@ export class BrowserSession {
   private epoch = 0
   /** One-shot takeover notice armed by takeOver(), consumed by the next snapshot. */
   private takeoverNotice = false
-  /** The previous snapshot's elements, for the coarse added/removed diff. `null` = no baseline yet. */
-  private lastElements: SnapshotElement[] | null = null
+  /** The previous snapshot's AX nodes, for the backendNodeId diff. `null` = no baseline yet. */
+  private lastAxNodes: AxNode[] | null = null
 
   private constructor(browser: Browser | null, context: BrowserContext, page: Page, config: BrowserConfig, homeDir: string, ownsBrowser: boolean) {
     this.browser = browser
@@ -328,7 +345,7 @@ export class BrowserSession {
     // Stale refs from a previous page must not survive a navigation.
     this.refs.clear()
     // A navigation is a brand-new page, so drop the diff baseline.
-    this.lastElements = null
+    this.lastAxNodes = null
     await this.page.goto(url, { waitUntil: 'load', timeout: this.config.timeoutMs })
   }
 
@@ -354,16 +371,55 @@ export class BrowserSession {
       refs.set(ref, locator.nth(i))
     }
     this.refs = refs
-    const changes = this.lastElements === null ? undefined : diffElements(this.lastElements, elements)
-    this.lastElements = elements
+    const axNodes = await this.readAxNodes()
+    const changes = this.lastAxNodes === null ? undefined : diffAxNodes(this.lastAxNodes, axNodes)
+    this.lastAxNodes = axNodes
     const intervened = this.takeTakeoverNotice()
     return {
       title,
       url,
       elements,
       ...(truncated ? { truncated: true } : {}),
-      ...(changes !== undefined && (changes.added.length > 0 || changes.removed.length > 0) ? { changes } : {}),
+      ...(changes !== undefined && (changes.added.length > 0 || changes.deleted.length > 0 || changes.changed.length > 0) ? { changes } : {}),
       ...(intervened ? { notice: 'human took over — this snapshot reflects the current page state' } : {}),
+    }
+  }
+
+  /**
+   * Read the interactive nodes of the page's accessibility tree via CDP,
+   * keyed by their stable `(frameId, backendNodeId)` handle for the diff.
+   * Falls back to an empty list when the page is closing or CDP is unavailable.
+   */
+  private async readAxNodes(): Promise<AxNode[]> {
+    let cdp: CDPSession
+    try {
+      cdp = await this.page.context().newCDPSession(this.page)
+    } catch {
+      return []
+    }
+    try {
+      const { nodes } = await cdp.send('Accessibility.getFullAXTree')
+      const result: AxNode[] = []
+      for (const node of nodes) {
+        if (node.ignored) continue
+        const role = node.role?.value
+        if (typeof role !== 'string' || !INTERACTIVE_ROLE_SET.has(role)) continue
+        if (node.backendDOMNodeId === undefined) continue
+        const name = typeof node.name?.value === 'string' ? node.name.value : ''
+        let state: string | undefined
+        for (const prop of node.properties ?? []) {
+          if (prop.name === 'checked' || prop.name === 'selected' || prop.name === 'expanded' || prop.name === 'disabled') {
+            state = `${prop.name}=${String(prop.value?.value ?? true)}`
+            break
+          }
+        }
+        result.push({ key: `${node.frameId ?? ''}\u0000${node.backendDOMNodeId}`, role, name, state })
+      }
+      return result
+    } catch {
+      return []
+    } finally {
+      await cdp.detach().catch(() => {})
     }
   }
 

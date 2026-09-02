@@ -32,7 +32,8 @@ const snapshotSchema = {
       additionalProperties: false,
       properties: {
         added: { type: 'array', items: { type: 'string' } },
-        removed: { type: 'array', items: { type: 'string' } },
+        deleted: { type: 'array', items: { type: 'string' } },
+        changed: { type: 'array', items: { type: 'string' } },
       },
     },
   },

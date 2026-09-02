@@ -215,6 +215,8 @@ export class BrowserSession {
   private lastAxNodes: AxNode[] | null = null
   /** Pages that already have response/close listeners, so switching tabs doesn't double-register. */
   private readonly attached = new WeakSet<Page>()
+  /** Pages that already have a visibility bridge installed. */
+  private readonly visibilityAttached = new WeakSet<Page>()
 
   private constructor(browser: Browser | null, context: BrowserContext, page: Page, config: BrowserConfig, homeDir: string, ownsBrowser: boolean) {
     this.browser = browser
@@ -237,6 +239,7 @@ export class BrowserSession {
       page.on('response', (resp) => this.captureJson(resp))
       page.on('close', () => this.handlePageClosed(page))
     }
+    this.watchVisibility(page)
     for (const listener of this.pageListeners) listener(page)
   }
 
@@ -245,6 +248,39 @@ export class BrowserSession {
     if (page !== this.page) return
     const remaining = this.context.pages().filter((p) => !p.isClosed())
     if (remaining.length > 0) this.attachPage(remaining[remaining.length - 1])
+  }
+
+  /**
+   * Follow the tab the human activates in the browser: each page reports its
+   * `visibilitychange` (tab switch) through a CDP binding, and the session
+   * re-binds to whichever page became visible. Installed once per page and
+   * re-armed after navigations; the CDP session is detached on close.
+   */
+  private async watchVisibility(page: Page): Promise<void> {
+    if (this.visibilityAttached.has(page)) return
+    this.visibilityAttached.add(page)
+    if (page.isClosed()) return
+    const cdp = await page.context().newCDPSession(page).catch(() => undefined)
+    if (cdp === undefined) return
+    await cdp.send('Runtime.addBinding', { name: '__dshReportVisibility' }).catch(() => {})
+    cdp.on('Runtime.bindingCalled', (ev: { name: string }) => {
+      if (ev.name !== '__dshReportVisibility') return
+      // The listener only fires this binding when the page becomes visible.
+      if (page !== this.page && !page.isClosed()) this.attachPage(page)
+    })
+    const arm = () => {
+      if (page.isClosed()) return
+      void page
+        .evaluate(`document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') window.__dshReportVisibility('visible') })`)
+        .catch(() => {})
+    }
+    arm()
+    page.on('framenavigated', (frame) => {
+      if (frame === page.mainFrame()) arm()
+    })
+    page.once('close', () => {
+      cdp.detach().catch(() => {})
+    })
   }
 
   /** Subscribe to page rebinds (e.g. a mirror re-attaching its screencast). Returns a disposer. */

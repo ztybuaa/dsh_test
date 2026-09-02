@@ -248,6 +248,27 @@ describe('BrowserSessionManager', () => {
     }
   })
 
+  it('follows the tab the human activates', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    try {
+      const session = await manager.requireSession({ id: 'a' })
+      await session.navigate(base)
+      const firstPage = session.page
+
+      await session.page.click('a[target="_blank"]')
+      await expect.poll(() => session.page.url(), { timeout: 5000 }).toContain('/popup')
+      const secondPage = session.page
+      expect(secondPage).not.toBe(firstPage)
+
+      // wait for the visibility bridge, then simulate the human activating the first tab
+      await expect.poll(() => firstPage.evaluate('typeof window.__dshReportVisibility'), { timeout: 5000 }).toBe('function')
+      await firstPage.evaluate("window.__dshReportVisibility('visible')")
+      expect(session.page).toBe(firstPage)
+    } finally {
+      await manager.dispose()
+    }
+  })
+
   it('closes one session without touching others, and dispose closes the rest', async () => {
     const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
     const keyA = { id: 'a' }

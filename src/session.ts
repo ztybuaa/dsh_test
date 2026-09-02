@@ -574,6 +574,9 @@ export class BrowserSessionManager {
   private readonly live = new Set<BrowserSession>()
   private defaultSession: BrowserSession | undefined
   private recreateNotice: string | undefined
+  /** The session the mirror should follow: the most recent agent-driven session. */
+  private primarySession: BrowserSession | undefined
+  private readonly primaryListeners: Array<(session: BrowserSession) => void> = []
 
   constructor(config: BrowserConfig) {
     this.config = config
@@ -584,22 +587,50 @@ export class BrowserSessionManager {
     if (key !== undefined) {
       const existing = this.sessions.get(key)
       if (existing !== undefined) {
-        if (existing.isAlive()) return existing
+        if (existing.isAlive()) {
+          this.setPrimary(existing)
+          return existing
+        }
         this.sessions.delete(key)
         this.live.delete(existing)
         this.recreateNotice = 'session was recreated (previous page lost) — navigate again'
       }
       const created = await this.createSession()
       this.sessions.set(key, created)
+      this.setPrimary(created)
       return created
     }
+    // Mirror path (no key): follow the agent's primary session when one exists,
+    // otherwise fall back to a shared default.
+    if (this.primarySession !== undefined && this.primarySession.isAlive()) return this.primarySession
     if (this.defaultSession !== undefined && !this.defaultSession.isAlive()) {
       this.live.delete(this.defaultSession)
       this.defaultSession = undefined
       this.recreateNotice = 'session was recreated (previous page lost) — navigate again'
     }
     this.defaultSession ??= await this.createSession()
+    this.setPrimary(this.defaultSession)
     return this.defaultSession
+  }
+
+  /** The session the mirror should stream, without creating one (undefined until the agent drives). */
+  getPrimarySession(): BrowserSession | undefined {
+    return this.primarySession !== undefined && this.primarySession.isAlive() ? this.primarySession : undefined
+  }
+
+  private setPrimary(session: BrowserSession): void {
+    if (this.primarySession === session) return
+    this.primarySession = session
+    for (const listener of this.primaryListeners) listener(session)
+  }
+
+  /** Subscribe to the primary (mirrored) session changing. Returns a disposer. */
+  onPrimaryChange(listener: (session: BrowserSession) => void): () => void {
+    this.primaryListeners.push(listener)
+    return () => {
+      const i = this.primaryListeners.indexOf(listener)
+      if (i >= 0) this.primaryListeners.splice(i, 1)
+    }
   }
 
   /** One-shot notice explaining why the agent's previous page is gone (consumed by tools). */
@@ -621,6 +652,7 @@ export class BrowserSessionManager {
     }
     if (session === undefined) return false
     this.live.delete(session)
+    if (this.primarySession === session) this.primarySession = undefined
     await session.close()
     return true
   }
@@ -630,6 +662,7 @@ export class BrowserSessionManager {
     const sessions = [...this.live]
     this.live.clear()
     this.defaultSession = undefined
+    this.primarySession = undefined
     await Promise.all(sessions.map((session) => session.close()))
   }
 

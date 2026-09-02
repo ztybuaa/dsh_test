@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { CDPSession, Page } from 'playwright'
-import type { BrowserSessionManager } from './session.ts'
+import type { BrowserSession, BrowserSessionManager } from './session.ts'
 
 /** Minimal slice of the DSH webServer seam the mirror consumes. */
 export interface WebServerLike {
@@ -58,30 +58,24 @@ export function registerMirrorRoutes(manager: BrowserSessionManager, webServer: 
     name: 'browser-use-input',
     kind: 'exact',
     path: '/browser-use/input',
-    handler: (req, res) => {
-      void relayInput(manager, req, res, frameSize)
-    },
+    handler: (req, res) => relayInput(manager, req, res, frameSize),
   })
 
   webServer.register({
     name: 'browser-use-takeover',
     kind: 'exact',
     path: '/browser-use/takeover',
-    handler: (req, res) => {
-      void setTakeover(manager, req, res)
-    },
+    handler: (req, res) => setTakeover(manager, req, res),
   })
 }
 
-/** Stream the session's current page as MJPEG, following target=_blank page rebinds. */
+/** Stream the primary session's current page as MJPEG, following session swaps and target=_blank page rebinds. */
 async function streamFrames(
   manager: BrowserSessionManager,
   req: IncomingMessage,
   res: ServerResponse,
   frameSize: FrameSize,
 ): Promise<void> {
-  const session = await manager.requireSession()
-
   res.writeHead(200, {
     'content-type': 'multipart/x-mixed-replace; boundary=frame',
     'cache-control': 'no-cache',
@@ -89,10 +83,16 @@ async function streamFrames(
   })
 
   let cdp: CDPSession | undefined
+  let disposePage: (() => void) | undefined
   let closed = false
 
   const attach = async (page: Page): Promise<void> => {
     if (closed) return
+    if (cdp !== undefined) {
+      cdp.send('Page.stopScreencast').catch(() => {})
+      cdp.detach().catch(() => {})
+      cdp = undefined
+    }
     cdp = await page.context().newCDPSession(page)
     cdp.on('Page.screencastFrame', (raw) => {
       const frame = raw as unknown as ScreencastFrame
@@ -107,18 +107,27 @@ async function streamFrames(
     await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 80, everyNthFrame: 1 })
   }
 
-  const offPage = session.onPageChange((page) => {
+  const follow = (session: BrowserSession): void => {
     if (closed) return
-    cdp?.send('Page.stopScreencast').catch(() => {})
-    void attach(page)
-  })
+    disposePage?.()
+    disposePage = session.onPageChange((page) => void attach(page))
+    void attach(session.page)
+  }
 
-  await attach(session.page)
+  // Mirror the agent's session; while none exists, hold the stream open (the
+  // panel shows its background) and start once the agent drives the browser.
+  const disposePrimary = manager.onPrimaryChange(follow)
+  const initial = manager.getPrimarySession()
+  if (initial !== undefined) follow(initial)
 
   req.on('close', () => {
     closed = true
-    offPage()
-    cdp?.send('Page.stopScreencast').catch(() => {})
+    disposePrimary()
+    disposePage?.()
+    if (cdp !== undefined) {
+      cdp.send('Page.stopScreencast').catch(() => {})
+      cdp.detach().catch(() => {})
+    }
   })
 }
 

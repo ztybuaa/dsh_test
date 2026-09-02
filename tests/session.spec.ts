@@ -159,6 +159,31 @@ describe('BrowserSessionManager', () => {
     }
   })
 
+  it('tracks a primary session for the mirror and notifies on change', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    try {
+      expect(manager.getPrimarySession()).toBeUndefined()
+
+      let notified = 0
+      const off = manager.onPrimaryChange(() => {
+        notified += 1
+      })
+      const key = { id: 'a' }
+      const a = await manager.requireSession(key)
+      expect(manager.getPrimarySession()).toBe(a)
+      expect(notified).toBe(1)
+
+      // the mirror (no key) resolves to the agent's primary session, not a second browser
+      const mirror = await manager.requireSession()
+      expect(mirror).toBe(a)
+      expect(manager.liveSessionCount).toBe(1)
+
+      off()
+    } finally {
+      await manager.dispose()
+    }
+  })
+
   it('closes one session without touching others, and dispose closes the rest', async () => {
     const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
     const keyA = { id: 'a' }

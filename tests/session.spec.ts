@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { BrowserSessionManager } from '../src/session.ts'
+import { BrowserSessionManager, diffElements } from '../src/session.ts'
 
 let server: Server
 let base: string
@@ -25,6 +25,14 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()))
+})
+
+describe('diffElements', () => {
+  it('reports elements that appeared or disappeared by role+name', () => {
+    expect(diffElements([], [{ ref: 1, role: 'link', name: 'About' }])).toEqual({ added: ['link "About"'], removed: [] })
+    expect(diffElements([{ ref: 1, role: 'link', name: 'About' }], [])).toEqual({ added: [], removed: ['link "About"'] })
+    expect(diffElements([{ ref: 1, role: 'link', name: 'About' }], [{ ref: 1, role: 'link', name: 'About' }])).toEqual({ added: [], removed: [] })
+  })
 })
 
 describe('BrowserSessionManager', () => {
@@ -74,6 +82,28 @@ describe('BrowserSessionManager', () => {
       })
       await session.page.click('a[target="_blank"]')
       await expect.poll(() => notifiedUrl, { timeout: 5000 }).toContain('/popup')
+    } finally {
+      await manager.dispose()
+    }
+  })
+
+  it('reports a coarse added/removed diff across snapshots', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    try {
+      const session = await manager.requireSession({ id: 'a' })
+      await session.navigate(base)
+      const first = await session.snapshot()
+      expect(first.changes).toBeUndefined()
+      await session.page.evaluate(() => {
+        const a = document.createElement('a')
+        a.href = '/popup'
+        a.textContent = 'New link'
+        document.body.appendChild(a)
+      })
+      const second = await session.snapshot()
+      expect(second.changes?.added).toContain('link "New link"')
+      const third = await session.snapshot()
+      expect(third.changes).toBeUndefined()
     } finally {
       await manager.dispose()
     }

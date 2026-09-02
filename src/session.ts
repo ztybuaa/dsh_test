@@ -45,6 +45,30 @@ export interface PageSnapshot {
   truncated?: boolean
   /** One-shot notice about the session (e.g. "recreated after a crash"). */
   notice?: string
+  /** Coarse added/removed diff vs the previous snapshot (keyed by role+name). */
+  changes?: SnapshotChanges
+}
+
+/** Elements that appeared / disappeared between two consecutive snapshots. */
+export interface SnapshotChanges {
+  added: string[]
+  removed: string[]
+}
+
+/**
+ * Diff two element lists by role+name. This is a coarse content diff: a
+ * stable `backendNodeId` handle (per #24) would be more precise, but requires
+ * switching the snapshot source to `Accessibility.getFullAXTree`. Kept light
+ * so the model still gets a "what changed" summary after a human cedes.
+ */
+export function diffElements(prev: SnapshotElement[], next: SnapshotElement[]): SnapshotChanges {
+  const key = (e: SnapshotElement) => `${e.role}\u0000${e.name}`
+  const prevKeys = new Set(prev.map(key))
+  const nextKeys = new Set(next.map(key))
+  const label = (e: SnapshotElement) => `${e.role} "${e.name}"`
+  const added = next.filter((e) => !prevKeys.has(key(e))).map(label)
+  const removed = prev.filter((e) => !nextKeys.has(key(e))).map(label)
+  return { added, removed }
 }
 
 /** Truncate text at a character cap without splitting a surrogate pair. */
@@ -137,6 +161,11 @@ export function formatSnapshot(snapshot: PageSnapshot): string {
   }
   if (snapshot.elements.length === 0) lines.push('(none)')
   if (snapshot.truncated) lines.push(`(snapshot truncated at ${snapshot.elements.length} elements — call browser_extract for full content)`)
+  if (snapshot.changes && (snapshot.changes.added.length > 0 || snapshot.changes.removed.length > 0)) {
+    lines.push('', 'Changes since last snapshot:')
+    for (const added of snapshot.changes.added) lines.push(`  + ${added}`)
+    for (const removed of snapshot.changes.removed) lines.push(`  - ${removed}`)
+  }
   if (snapshot.notice) lines.unshift(`Notice: ${snapshot.notice}`)
   return lines.join('\n')
 }
@@ -165,6 +194,8 @@ export class BrowserSession {
   private epoch = 0
   /** One-shot takeover notice armed by takeOver(), consumed by the next snapshot. */
   private takeoverNotice = false
+  /** The previous snapshot's elements, for the coarse added/removed diff. `null` = no baseline yet. */
+  private lastElements: SnapshotElement[] | null = null
 
   private constructor(browser: Browser | null, context: BrowserContext, page: Page, config: BrowserConfig, homeDir: string, ownsBrowser: boolean) {
     this.browser = browser
@@ -296,6 +327,8 @@ export class BrowserSession {
   async navigate(url: string): Promise<void> {
     // Stale refs from a previous page must not survive a navigation.
     this.refs.clear()
+    // A navigation is a brand-new page, so drop the diff baseline.
+    this.lastElements = null
     await this.page.goto(url, { waitUntil: 'load', timeout: this.config.timeoutMs })
   }
 
@@ -321,8 +354,17 @@ export class BrowserSession {
       refs.set(ref, locator.nth(i))
     }
     this.refs = refs
+    const changes = this.lastElements === null ? undefined : diffElements(this.lastElements, elements)
+    this.lastElements = elements
     const intervened = this.takeTakeoverNotice()
-    return { title, url, elements, ...(truncated ? { truncated: true } : {}), ...(intervened ? { notice: 'human took over — this snapshot reflects the current page state' } : {}) }
+    return {
+      title,
+      url,
+      elements,
+      ...(truncated ? { truncated: true } : {}),
+      ...(changes !== undefined && (changes.added.length > 0 || changes.removed.length > 0) ? { changes } : {}),
+      ...(intervened ? { notice: 'human took over — this snapshot reflects the current page state' } : {}),
+    }
   }
 
   /** Click the element addressed by `ref` from the most recent snapshot. */

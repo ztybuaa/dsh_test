@@ -27,6 +27,14 @@ const snapshotSchema = {
     },
     notice: { type: 'string' },
     truncated: { type: 'boolean' },
+    changes: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        added: { type: 'array', items: { type: 'string' } },
+        removed: { type: 'array', items: { type: 'string' } },
+      },
+    },
   },
 } as const
 

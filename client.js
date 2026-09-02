@@ -128,7 +128,7 @@ window.__ModuleLoader__.load({
             right: 16,
             top: 16,
             zIndex: 9999,
-            width: 900,
+            width: 1000,
             display: 'flex',
             flexDirection: 'column',
             background: 'rgba(20,20,26,0.97)',

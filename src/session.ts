@@ -227,6 +227,10 @@ export class BrowserSession {
     this.attachPage(page)
     // Follow new pages opened via target=_blank / window.open.
     context.on('page', (newPage) => this.attachPage(newPage))
+    // Pages already open (e.g. a persistent profile or a reused context) also
+    // need the visibility bridge, or the session can't follow a tab the human
+    // activates that predates this session.
+    for (const existing of context.pages()) this.watchVisibility(existing)
   }
 
   /** Bind a page as the current one: capture its JSON responses and drop stale refs. */
@@ -692,6 +696,7 @@ export class BrowserSessionManager {
         }
         this.sessions.delete(key)
         this.live.delete(existing)
+        void existing.close() // don't orphan the old browser window/process
         this.recreateNotice = 'session was recreated (previous page lost) — navigate again'
       }
       const created = await this.createSession()
@@ -703,8 +708,10 @@ export class BrowserSessionManager {
     // otherwise fall back to a shared default.
     if (this.primarySession !== undefined && this.primarySession.isAlive()) return this.primarySession
     if (this.defaultSession !== undefined && !this.defaultSession.isAlive()) {
-      this.live.delete(this.defaultSession)
+      const dead = this.defaultSession
+      this.live.delete(dead)
       this.defaultSession = undefined
+      void dead.close() // don't orphan the old browser window/process
       this.recreateNotice = 'session was recreated (previous page lost) — navigate again'
     }
     this.defaultSession ??= await this.createSession()

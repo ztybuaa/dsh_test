@@ -128,7 +128,7 @@ window.__ModuleLoader__.load({
             right: 16,
             top: 16,
             zIndex: 9999,
-            width: 1000,
+            width: 1240,
             display: 'flex',
             flexDirection: 'column',
             background: 'rgba(20,20,26,0.97)',
@@ -151,7 +151,7 @@ window.__ModuleLoader__.load({
               borderBottom: '1px solid rgba(255,255,255,0.1)',
             },
           },
-          h('span', { style: { fontWeight: 600 } }, takeover ? '人接管中' : 'browser-use mirror'),
+          h('span', { style: { fontWeight: 600 } }, takeover ? '人接管中' : 'dsh-browser-use'),
           h(
             'div',
             { style: { display: 'flex', gap: 8, alignItems: 'center' } },

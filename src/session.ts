@@ -187,6 +187,17 @@ export function formatSnapshot(snapshot: PageSnapshot): string {
   return lines.join('\n')
 }
 
+/** How often the session polls Chrome for the foreground tab (milliseconds). */
+const FOLLOW_POLL_MS = 500
+
+/** Chrome 150+ `embedderData` on `type: 'tab'` targets. Playwright's bundled protocol types predate it. */
+interface TabEmbedderData {
+  tabActive?: boolean
+  tabPinned?: boolean
+  tabStripIndex?: number
+  tabGroupId?: string
+}
+
 /**
  * One live browser session: a launched chromium, its context, and a single
  * page. The owning manager owns its lifecycle.
@@ -215,8 +226,8 @@ export class BrowserSession {
   private lastAxNodes: AxNode[] | null = null
   /** Pages that already have response/close listeners, so switching tabs doesn't double-register. */
   private readonly attached = new WeakSet<Page>()
-  /** Pages that already have a visibility bridge installed. */
-  private readonly visibilityAttached = new WeakSet<Page>()
+  /** Interval handle for the foreground-follow poll; cleared on close. */
+  private followTimer: NodeJS.Timeout | undefined
 
   private constructor(browser: Browser | null, context: BrowserContext, page: Page, config: BrowserConfig, homeDir: string, ownsBrowser: boolean) {
     this.browser = browser
@@ -227,10 +238,7 @@ export class BrowserSession {
     this.attachPage(page)
     // Follow new pages opened via target=_blank / window.open.
     context.on('page', (newPage) => this.attachPage(newPage))
-    // Pages already open (e.g. a persistent profile or a reused context) also
-    // need the visibility bridge, or the session can't follow a tab the human
-    // activates that predates this session.
-    for (const existing of context.pages()) this.watchVisibility(existing)
+    this.startFollowTimer()
   }
 
   /** Bind a page as the current one: capture its JSON responses and drop stale refs. */
@@ -243,7 +251,6 @@ export class BrowserSession {
       page.on('response', (resp) => this.captureJson(resp))
       page.on('close', () => this.handlePageClosed(page))
     }
-    this.watchVisibility(page)
     for (const listener of this.pageListeners) listener(page)
   }
 
@@ -255,36 +262,28 @@ export class BrowserSession {
   }
 
   /**
-   * Follow the tab the human activates in the browser: each page reports its
-   * `visibilitychange` (tab switch) through a CDP binding, and the session
-   * re-binds to whichever page became visible. Installed once per page and
-   * re-armed after navigations; the CDP session is detached on close.
+   * Keep `this.page` pointed at the browser's foreground tab. `document.visibilityState`
+   * cannot be trusted: Playwright launches Chrome with backgrounding disabled, so every
+   * tab reports `visible` and neither `visibilitychange` nor
+   * `Page.screencastVisibilityChanged` fires. Chrome 150+ reports the real active tab
+   * through `Target.getTargets` (`embedderData.tabActive`), which is pull-based, so poll it.
    */
-  private async watchVisibility(page: Page): Promise<void> {
-    if (this.visibilityAttached.has(page)) return
-    this.visibilityAttached.add(page)
-    if (page.isClosed()) return
-    const cdp = await page.context().newCDPSession(page).catch(() => undefined)
-    if (cdp === undefined) return
-    await cdp.send('Runtime.addBinding', { name: '__dshReportVisibility' }).catch(() => {})
-    cdp.on('Runtime.bindingCalled', (ev: { name: string }) => {
-      if (ev.name !== '__dshReportVisibility') return
-      // The listener only fires this binding when the page becomes visible.
-      if (page !== this.page && !page.isClosed()) this.attachPage(page)
-    })
-    const arm = () => {
-      if (page.isClosed()) return
-      void page
-        .evaluate(`document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') window.__dshReportVisibility('visible') })`)
-        .catch(() => {})
-    }
-    arm()
-    page.on('framenavigated', (frame) => {
-      if (frame === page.mainFrame()) arm()
-    })
-    page.once('close', () => {
-      cdp.detach().catch(() => {})
-    })
+  private startFollowTimer(): void {
+    this.followTimer = setInterval(() => {
+      void this.followForegroundTab()
+    }, FOLLOW_POLL_MS)
+    this.followTimer.unref?.()
+  }
+
+  /** Poll the foreground tab and re-bind when it changed (human switched tabs in Chrome). */
+  private async followForegroundTab(): Promise<void> {
+    const pages = this.context.pages()
+    if (pages.length < 2) return
+    const idx = await this.activePageIndex()
+    if (idx === undefined) return
+    if (pages.indexOf(this.page) + 1 === idx) return
+    const target = pages[idx - 1]
+    if (target !== undefined && !target.isClosed()) this.attachPage(target)
   }
 
   /** Subscribe to page rebinds (e.g. a mirror re-attaching its screencast). Returns a disposer. */
@@ -436,18 +435,50 @@ export class BrowserSession {
       throw new Error(`browser-use: tab ${index} does not exist (${pages.length} tab(s) open)`)
     }
     this.attachPage(target)
+    // Agent-driven switches must also move Chrome's active tab, or the
+    // foreground-follow poll would immediately switch the session back.
+    void target.bringToFront().catch(() => {})
   }
 
-  /** 1-based index of the page that is currently visible (foreground tab), or undefined if none. */
+  /**
+   * 1-based index of the browser's foreground tab, or undefined when it cannot
+   * be determined. `document.visibilityState` is NOT usable here: Playwright
+   * launches Chrome with backgrounding disabled, so every tab reports `visible`.
+   * Chrome 150+ reports the real active tab via `Target.getTargets` →
+   * `embedderData.tabActive` (pull-based). Older Chrome / bundled Chromium have no
+   * such metadata, so this degrades to `undefined`.
+   */
   async activePageIndex(): Promise<number | undefined> {
     const pages = this.context.pages()
-    for (let i = 0; i < pages.length; i++) {
-      const p = pages[i]
-      if (p.isClosed()) continue
-      const vis = await p.evaluate(() => document.visibilityState).catch(() => 'hidden')
-      if (vis === 'visible') return i + 1
+    if (pages.length === 0) return undefined
+    let cdp: CDPSession
+    try {
+      cdp = await this.page.context().newCDPSession(this.page)
+    } catch {
+      return undefined
     }
-    return undefined
+    try {
+      const { targetInfos } = await cdp.send('Target.getTargets', {
+        filter: [{ type: 'tab', exclude: false }, { exclude: true }],
+      })
+      const active = targetInfos.find((t) => {
+        if (t.type !== 'tab') return false
+        const data = t.embedderData as unknown as TabEmbedderData | undefined
+        return data?.tabActive === true
+      })
+      if (active === undefined) return undefined
+      // Map the active tab back to one of this context's pages. Prefer an exact
+      // URL match (robust to tab reordering); fall back to the tab-strip index.
+      const byUrl = pages.findIndex((p) => p.url() === active.url)
+      if (byUrl >= 0) return byUrl + 1
+      const strip = (active.embedderData as unknown as TabEmbedderData | undefined)?.tabStripIndex
+      if (typeof strip === 'number' && strip >= 0 && strip < pages.length) return strip + 1
+      return undefined
+    } catch {
+      return undefined
+    } finally {
+      await cdp.detach().catch(() => {})
+    }
   }
 
   /** Go back one step in the current page's history. */
@@ -665,6 +696,10 @@ export class BrowserSession {
 
   /** Close the browser and release its resources. */
   async close(): Promise<void> {
+    if (this.followTimer !== undefined) {
+      clearInterval(this.followTimer)
+      this.followTimer = undefined
+    }
     if (!this.ownsBrowser) {
       // CDP: we borrowed the user's running Chrome — close only our page, leave their browser intact.
       await this.page.close().catch(() => {})

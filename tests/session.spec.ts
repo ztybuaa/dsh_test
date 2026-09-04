@@ -248,8 +248,32 @@ describe('BrowserSessionManager', () => {
     }
   })
 
+  it('reports the foreground tab via activePageIndex', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000, channel: 'chrome' })
+    try {
+      const session = await manager.requireSession({ id: 'a' })
+      await session.navigate(base)
+      await session.page.click('a[target="_blank"]')
+      await expect.poll(() => session.page.url(), { timeout: 5000 }).toContain('/popup')
+
+      // The popup (tab 2) is the foreground tab.
+      expect(await session.activePageIndex()).toBe(2)
+
+      // Activate tab 1 via CDP, like a human clicking the tab strip.
+      const cdp = await session.page.context().newCDPSession(session.page)
+      const { targetInfos } = await cdp.send('Target.getTargets', { filter: [{ type: 'tab', exclude: false }, { exclude: true }] })
+      const firstTab = targetInfos.find((t: { url: string; targetId: string }) => !t.url.includes('/popup'))
+      await cdp.send('Target.activateTarget', { targetId: firstTab.targetId })
+      await cdp.detach().catch(() => {})
+
+      await expect.poll(() => session.activePageIndex(), { timeout: 3000 }).toBe(1)
+    } finally {
+      await manager.dispose()
+    }
+  })
+
   it('follows the tab the human activates', async () => {
-    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000, channel: 'chrome' })
     try {
       const session = await manager.requireSession({ id: 'a' })
       await session.navigate(base)
@@ -260,10 +284,14 @@ describe('BrowserSessionManager', () => {
       const secondPage = session.page
       expect(secondPage).not.toBe(firstPage)
 
-      // wait for the visibility bridge, then simulate the human activating the first tab
-      await expect.poll(() => firstPage.evaluate('typeof window.__dshReportVisibility'), { timeout: 5000 }).toBe('function')
-      await firstPage.evaluate("window.__dshReportVisibility('visible')")
-      expect(session.page).toBe(firstPage)
+      // Activate the first tab via CDP; the follow poll should re-bind the session.
+      const cdp = await session.page.context().newCDPSession(session.page)
+      const { targetInfos } = await cdp.send('Target.getTargets', { filter: [{ type: 'tab', exclude: false }, { exclude: true }] })
+      const firstTab = targetInfos.find((t: { url: string; targetId: string }) => !t.url.includes('/popup'))
+      await cdp.send('Target.activateTarget', { targetId: firstTab.targetId })
+      await cdp.detach().catch(() => {})
+
+      await expect.poll(() => session.page, { timeout: 5000 }).toBe(firstPage)
     } finally {
       await manager.dispose()
     }

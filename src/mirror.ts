@@ -67,13 +67,6 @@ export function registerMirrorRoutes(manager: BrowserSessionManager, webServer: 
     path: '/browser-use/takeover',
     handler: (req, res) => setTakeover(manager, req, res),
   })
-
-  webServer.register({
-    name: 'browser-use-viewport',
-    kind: 'exact',
-    path: '/browser-use/viewport',
-    handler: (req, res) => setViewport(manager, req, res),
-  })
 }
 
 /** Stream the primary session's current page as MJPEG, following session swaps and target=_blank page rebinds. */
@@ -190,35 +183,4 @@ async function setTakeover(manager: BrowserSessionManager, req: IncomingMessage,
 
   res.writeHead(200, { 'content-type': 'application/json' })
   res.end(JSON.stringify({ ok: true, takeover: session.isTakeover }))
-}
-
-/** Viewport bounds: small enough for a narrow sidebar, capped so a huge pane cannot thrash the page. */
-const MIN_VIEWPORT = 240
-const MAX_VIEWPORT_WIDTH = 1920
-const MAX_VIEWPORT_HEIGHT = 1280
-
-/** Clamp one requested dimension into the supported viewport range. */
-function clampSize(value: unknown, min: number, max: number, fallback: number): number {
-  const n = typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : fallback
-  return Math.min(max, Math.max(min, n))
-}
-
-/**
- * Resize the agent's page to the observation panel's content box.
- *
- * Matching the page viewport to the panel is what makes the screencast FILL the
- * panel instead of being scaled down into it, and it is also what keeps relayed
- * pointer coordinates exact: a frame whose aspect ratio differs from the panel's
- * letterboxes, and every normalized click then lands somewhere it was not aimed.
- */
-async function setViewport(manager: BrowserSessionManager, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJson<{ width?: number; height?: number }>(req)
-  const width = clampSize(body.width, MIN_VIEWPORT, MAX_VIEWPORT_WIDTH, 1280)
-  const height = clampSize(body.height, MIN_VIEWPORT, MAX_VIEWPORT_HEIGHT, 720)
-
-  const session = await manager.requireSession()
-  await session.page.setViewportSize({ width, height })
-
-  res.writeHead(200, { 'content-type': 'application/json' })
-  res.end(JSON.stringify({ ok: true, width, height }))
 }

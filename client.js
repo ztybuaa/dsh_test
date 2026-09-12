@@ -32,6 +32,15 @@ window.__ModuleLoader__.load({
       })
     }
 
+    /** Tell the host what size the agent's page should be, so the frame fills the panel. */
+    function postViewport(width, height) {
+      fetch('/browser-use/viewport', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ width: Math.round(width), height: Math.round(height) }),
+      }).catch(function () {})
+    }
+
     /**
      * The live browser view. Used both as a sidebar tab (fills its tab and
      * unmounts the <img> while hidden, so the host stream stops) and as the
@@ -81,9 +90,41 @@ window.__ModuleLoader__.load({
         return function () { document.removeEventListener('keydown', onKeyDown) }
       }, [takeover])
 
+      // Keep the page the size of the panel's content box. A page viewport that
+      // matches the panel makes the screencast fill it (no letterbox) and keeps
+      // relayed pointer coordinates exact.
+      react.useEffect(function () {
+        var el = imgRef.current
+        if (el === null || !visible) return undefined
+        function sync() {
+          var rect = el.getBoundingClientRect()
+          if (rect.width > 0 && rect.height > 0) postViewport(rect.width, rect.height)
+        }
+        sync()
+        var observer = typeof ResizeObserver === 'function' ? new ResizeObserver(sync) : null
+        if (observer !== null) observer.observe(el)
+        window.addEventListener('resize', sync)
+        return function () {
+          if (observer !== null) observer.disconnect()
+          window.removeEventListener('resize', sync)
+        }
+      }, [visible])
+
       function norm(e) {
-        var rect = imgRef.current.getBoundingClientRect()
-        return { x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height }
+        var el = imgRef.current
+        var rect = el.getBoundingClientRect()
+        // The frame is letterboxed inside the <img> box (object-fit: contain), so
+        // map through the rendered image area rather than the whole box —
+        // otherwise every relayed click lands offset from where it was aimed.
+        var nw = el.naturalWidth || rect.width
+        var nh = el.naturalHeight || rect.height
+        var frameAspect = nh === 0 ? 1 : nw / nh
+        var boxAspect = rect.height === 0 ? frameAspect : rect.width / rect.height
+        var rw = frameAspect > boxAspect ? rect.width : rect.height * frameAspect
+        var rh = frameAspect > boxAspect ? rect.width / frameAspect : rect.height
+        var left = rect.left + (rect.width - rw) / 2
+        var top = rect.top + (rect.height - rh) / 2
+        return { x: (e.clientX - left) / rw, y: (e.clientY - top) / rh }
       }
 
       function onMouseDown(e) {

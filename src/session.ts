@@ -228,6 +228,12 @@ export class BrowserSession {
   private readonly attached = new WeakSet<Page>()
   /** Interval handle for the foreground-follow poll; cleared on close. */
   private followTimer: NodeJS.Timeout | undefined
+  /**
+   * The foreground tab index seen on the previous poll. The follow only acts on a
+   * CHANGE, so a tab the panel switched to quietly — which deliberately does not
+   * move Chrome's active tab — is not immediately reverted by the next poll.
+   */
+  private lastForegroundIndex: number | undefined
 
   private constructor(browser: Browser | null, context: BrowserContext, page: Page, config: BrowserConfig, homeDir: string, ownsBrowser: boolean) {
     this.browser = browser
@@ -275,12 +281,19 @@ export class BrowserSession {
     this.followTimer.unref?.()
   }
 
-  /** Poll the foreground tab and re-bind when it changed (human switched tabs in Chrome). */
+  /**
+   * Poll the foreground tab and re-bind when it CHANGED (the human switched tabs
+   * in the real Chrome). Reacting only to a change — rather than to any
+   * difference from the current page — is what keeps a quiet panel-side switch
+   * stable: it leaves Chrome's active tab alone, so there is no change to react to.
+   */
   private async followForegroundTab(): Promise<void> {
     const pages = this.context.pages()
     if (pages.length < 2) return
     const idx = await this.activePageIndex()
     if (idx === undefined) return
+    if (idx === this.lastForegroundIndex) return
+    this.lastForegroundIndex = idx
     if (pages.indexOf(this.page) + 1 === idx) return
     const target = pages[idx - 1]
     if (target !== undefined && !target.isClosed()) this.attachPage(target)
@@ -427,17 +440,25 @@ export class BrowserSession {
     return out
   }
 
-  /** Switch the current page to the tab at `index` (1-based). */
-  switchPage(index: number): void {
+  /**
+   * Switch the current page to the tab at `index` (1-based).
+   *
+   * `quiet` skips `bringToFront()`, which raises the real Chrome window: the
+   * observation panel switches tabs from the sidebar, and dragging the human out
+   * of the panel — or waking a minimized browser — is exactly what it must not do.
+   * The follow poll no longer fights a quiet switch back, because it now reacts
+   * only to a CHANGE in Chrome's foreground tab, which a quiet switch leaves alone.
+   */
+  switchPage(index: number, options: { quiet?: boolean } = {}): void {
     const pages = this.context.pages()
     const target = pages[index - 1]
     if (target === undefined) {
       throw new Error(`browser-use: tab ${index} does not exist (${pages.length} tab(s) open)`)
     }
     this.attachPage(target)
-    // Agent-driven switches must also move Chrome's active tab, or the
-    // foreground-follow poll would immediately switch the session back.
-    void target.bringToFront().catch(() => {})
+    // A non-quiet (agent-driven) switch also moves Chrome's real active tab, so
+    // the window does not disagree with the session.
+    if (options.quiet !== true) void target.bringToFront().catch(() => {})
   }
 
   /**

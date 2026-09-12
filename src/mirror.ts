@@ -231,7 +231,21 @@ async function setViewport(manager: BrowserSessionManager, req: IncomingMessage,
   const height = clampSize(body.height, MIN_VIEWPORT, MAX_VIEWPORT_HEIGHT, 720)
 
   const session = await manager.requireSession()
-  await session.page.setViewportSize({ width, height })
+  // CDP device metrics, NOT page.setViewportSize(): the latter resizes the real
+  // browser WINDOW in headful mode, which raises/awakens the browser the human is
+  // not looking at and disturbs Chrome's own tab-activation state. The override
+  // changes only the page's viewport, leaving the window untouched.
+  const cdp = await session.page.context().newCDPSession(session.page)
+  try {
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width,
+      height,
+      deviceScaleFactor: 1,
+      mobile: false,
+    })
+  } finally {
+    await cdp.detach().catch(() => {})
+  }
 
   res.writeHead(200, { 'content-type': 'application/json' })
   res.end(JSON.stringify({ ok: true, width, height }))
@@ -263,7 +277,9 @@ async function switchTab(manager: BrowserSessionManager, req: IncomingMessage, r
   }
   try {
     const session = await manager.requireSession()
-    session.switchPage(index)
+    // quiet: the panel switches tabs from the sidebar, so the real Chrome window
+    // must not be raised for it.
+    session.switchPage(index, { quiet: true })
   } catch (error) {
     res.writeHead(404, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }))

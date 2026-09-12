@@ -62,6 +62,10 @@ window.__ModuleLoader__.load({
       var boxRef = react.useRef(null)
       var hoverRef = react.useRef(false)
       var lastMoveRef = react.useRef(0)
+      /** TEMPORARY diagnostic readout: sizes on screen so a screenshot carries the facts. */
+      var debugState = react.useState('')
+      var debug = debugState[0]
+      var setDebug = debugState[1]
 
       function toggleTakeover() {
         var next = !takeover
@@ -104,6 +108,16 @@ window.__ModuleLoader__.load({
           var rect = el.getBoundingClientRect()
           var w = Math.round(rect.width)
           var h = Math.round(rect.height)
+          var parent = el.parentElement
+          var prect = parent === null ? null : parent.getBoundingClientRect()
+          var img = imgRef.current
+          // TEMPORARY diagnostic: box / parent / frame sizes, straight from the DOM.
+          setDebug(
+            'box ' + w + 'x' + h +
+            ' | parent ' + (prect === null ? '?' : Math.round(prect.width) + 'x' + Math.round(prect.height)) +
+            ' | frame ' + (img === null ? '?' : (img.naturalWidth || 0) + 'x' + (img.naturalHeight || 0)) +
+            ' | dpr ' + (window.devicePixelRatio || 1),
+          )
           if (w <= 0 || h <= 0) return
           var key = w + 'x' + h
           if (key === last) return
@@ -114,9 +128,11 @@ window.__ModuleLoader__.load({
         var observer = typeof ResizeObserver === 'function' ? new ResizeObserver(sync) : null
         if (observer !== null) observer.observe(el)
         window.addEventListener('resize', sync)
+        var tick = setInterval(sync, 1000)
         return function () {
           if (observer !== null) observer.disconnect()
           window.removeEventListener('resize', sync)
+          clearInterval(tick)
         }
       }, [visible])
 
@@ -272,6 +288,27 @@ window.__ModuleLoader__.load({
                 },
               },
               '标签页未激活',
+            ),
+        debug === ''
+          ? null
+          : h(
+              'div',
+              {
+                style: {
+                  position: 'absolute',
+                  left: 2,
+                  top: 2,
+                  zIndex: 5,
+                  padding: '2px 6px',
+                  background: 'rgba(0,0,0,0.78)',
+                  color: '#7cfc00',
+                  font: '11px/1.4 monospace',
+                  borderRadius: 4,
+                  pointerEvents: 'none',
+                  whiteSpace: 'pre',
+                },
+              },
+              debug,
             ),
       )
 

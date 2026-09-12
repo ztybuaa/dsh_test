@@ -58,6 +58,8 @@ window.__ModuleLoader__.load({
       var takeover = takeoverState[0]
       var setTakeover = takeoverState[1]
       var imgRef = react.useRef(null)
+      /** The definite-size frame box; the viewport sync observes THIS, not the img. */
+      var boxRef = react.useRef(null)
       var hoverRef = react.useRef(false)
       var lastMoveRef = react.useRef(0)
 
@@ -92,13 +94,21 @@ window.__ModuleLoader__.load({
 
       // Keep the page the size of the panel's content box. A page viewport that
       // matches the panel makes the screencast fill it (no letterbox) and keeps
-      // relayed pointer coordinates exact.
+      // relayed pointer coordinates exact. Observed on the BOX, not the img: the
+      // img is sized by the frame, so feeding its size back would lock the panel.
       react.useEffect(function () {
-        var el = imgRef.current
+        var el = boxRef.current
         if (el === null || !visible) return undefined
+        var last = ''
         function sync() {
           var rect = el.getBoundingClientRect()
-          if (rect.width > 0 && rect.height > 0) postViewport(rect.width, rect.height)
+          var w = Math.round(rect.width)
+          var h = Math.round(rect.height)
+          if (w <= 0 || h <= 0) return
+          var key = w + 'x' + h
+          if (key === last) return
+          last = key
+          postViewport(w, h)
         }
         sync()
         var observer = typeof ResizeObserver === 'function' ? new ResizeObserver(sync) : null
@@ -210,52 +220,62 @@ window.__ModuleLoader__.load({
         ),
       )
 
-      if (!visible) {
-        // Unmounted intentionally: with no <img> there is no MJPEG consumer, so
-        // the host route's `req.on('close')` stops the screencast.
-        return h(
-          'div',
-          { style: hostStyle },
-          bar,
-          h(
-            'div',
-            {
-              style: {
-                flex: '1 1 auto',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                color: '#86868b',
-              },
-            },
-            '标签页未激活',
-          ),
-        )
-      }
-
-      return h(
+      // The frame lives in a DEFINITE box. An <img> left to size itself takes the
+      // frame's intrinsic width, and because that width is what the viewport sync
+      // feeds back to the page, the panel locks at its first size and never grows
+      // when the sidebar is widened. An absolutely-filled box breaks that loop.
+      var box = h(
         'div',
-        { style: hostStyle },
-        bar,
-        h('img', {
-          ref: imgRef,
-          src: FRAME_STREAM,
-          onMouseDown: onMouseDown,
-          onMouseMove: onMouseMove,
-          onMouseUp: onMouseUp,
-          onMouseEnter: function () { hoverRef.current = true },
-          onMouseLeave: function () { hoverRef.current = false },
+        {
+          ref: boxRef,
           style: {
-            width: '100%',
+            position: 'relative',
             flex: '1 1 auto',
             minHeight: 0,
-            objectFit: 'contain',
-            display: 'block',
+            overflow: 'hidden',
             background: '#333',
-            cursor: takeover ? 'crosshair' : 'default',
           },
-        }),
+        },
+        visible
+          ? h('img', {
+              ref: imgRef,
+              src: FRAME_STREAM,
+              onMouseDown: onMouseDown,
+              onMouseMove: onMouseMove,
+              onMouseUp: onMouseUp,
+              onMouseEnter: function () { hoverRef.current = true },
+              onMouseLeave: function () { hoverRef.current = false },
+              style: {
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                width: '100%',
+                height: '100%',
+                objectFit: 'contain',
+                display: 'block',
+                cursor: takeover ? 'crosshair' : 'default',
+              },
+            })
+          : h(
+              'div',
+              {
+                style: {
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: '#86868b',
+                },
+              },
+              '标签页未激活',
+            ),
       )
+
+      return h('div', { style: hostStyle }, bar, box)
     }
 
     /** Descriptor of the sidebar tab this plugin contributes. */

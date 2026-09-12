@@ -228,30 +228,58 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** Read the betterSidebar service off a context, whichever accessor it exposes. */
+    function readBetterSidebar(scope) {
+      if (scope === undefined || scope === null) return undefined
+      if (scope.betterSidebar !== undefined) return scope.betterSidebar
+      return typeof scope.get === 'function' ? scope.get('betterSidebar') : undefined
+    }
+
     function apply(ctx) {
-      var betterSidebar = typeof ctx.get === 'function' ? ctx.get('betterSidebar') : undefined
-      if (
-        betterSidebar !== undefined &&
-        betterSidebar !== null &&
-        typeof betterSidebar.registerTab === 'function'
-      ) {
-        ctx.effect(function () {
-          return betterSidebar.registerTab(tabDescriptor())
+      var removeFallback = null
+
+      /** Legacy floating panel: the fallback for hosts without better-sidebar. */
+      function mountFallback() {
+        if (ctx.slots === undefined || ctx.slots === null || typeof ctx.slots.inject !== 'function') return
+        var dispose = ctx.slots.inject('shell.overlay', function () {
+          return ctx.slots.register(
+            { name: 'shell.overlay', id: 'browser-use-panel', order: 10 },
+            function () {
+              return react.createElement(AgentBrowserView, { floating: true, visible: true })
+            },
+          )
         })
-        return
+        if (typeof dispose === 'function') removeFallback = dispose
       }
 
-      // No better-sidebar: keep the legacy floating panel, and never throw when
-      // the shell slots service is missing too.
-      if (ctx.slots === undefined || ctx.slots === null || typeof ctx.slots.inject !== 'function') return
-      ctx.slots.inject('shell.overlay', function () {
-        return ctx.slots.register(
-          { name: 'shell.overlay', id: 'browser-use-panel', order: 10 },
-          function () {
-            return react.createElement(AgentBrowserView, { floating: true, visible: true })
-          },
-        )
-      })
+      // Mount the fallback first, then let the native tab supersede it and take
+      // the floating panel back down.
+      mountFallback()
+
+      // ctx.inject() — NOT a one-shot service sample. A profile's bundle order
+      // decides who boots first, and ours can precede better-sidebar's, so
+      // sampling the service at apply time would miss it and strand the plugin
+      // on the floating panel. Waiting on the dependency runs the callback
+      // whenever the service does appear, order-independent.
+      if (typeof ctx.inject === 'function') {
+        ctx.inject(['betterSidebar'], function (scope) {
+          var betterSidebar = readBetterSidebar(scope)
+          if (
+            betterSidebar === undefined ||
+            betterSidebar === null ||
+            typeof betterSidebar.registerTab !== 'function'
+          ) {
+            return
+          }
+          scope.effect(function () {
+            return betterSidebar.registerTab(tabDescriptor())
+          })
+          if (typeof removeFallback === 'function') {
+            removeFallback()
+            removeFallback = null
+          }
+        })
+      }
     }
 
     exports.apply = apply

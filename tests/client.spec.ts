@@ -4,11 +4,12 @@ import { describe, expect, it } from 'vitest'
 /**
  * The client half is a hand-written lazy-CJS module served to the Web GUI: it
  * calls `window.__ModuleLoader__.load({ id, factory })` and the factory builds
- * the plugin's `apply`. T1's load-bearing behaviour is the mount decision — a
- * native dsh-better-sidebar tab when that service is present, and a safe
- * fallback to the legacy `shell.overlay` panel when it is absent. This test
- * drives that decision without a DOM by capturing the spec and invoking the
- * factory with stub services.
+ * the plugin's `apply`. T1's load-bearing behaviour is the mount decision — the
+ * Agent browser must land in the sidebar's "+" menu as a native
+ * dsh-better-sidebar tab, and that service may appear AFTER this plugin boots
+ * (a profile's bundle order decides who goes first), so the decision waits on
+ * the dependency instead of sampling it once. The legacy shell.overlay panel is
+ * only the fallback for hosts without better-sidebar.
  */
 
 interface LoadedSpec {
@@ -38,35 +39,58 @@ function loadClient(): { apply: (ctx: unknown) => void; inject?: string[] } {
   return captured.factory(require)
 }
 
-/** A ctx whose only interesting surface is `get`, `effect` and `slots`. */
-function makeCtx(options: {
-  betterSidebar?: unknown
-  slots?: { inject: (name: string, fn: () => void) => void; register: (spec: unknown) => unknown }
-}): { ctx: Record<string, unknown>; registered: unknown[]; slotNames: string[] } {
-  const registered: unknown[] = []
-  const slotNames: string[] = []
-  const ctx: Record<string, unknown> = {
-    get: (name: string) => (name === 'betterSidebar' ? options.betterSidebar : undefined),
-    effect: (fn: () => unknown) => fn(),
-    slots:
-      options.slots ??
-      {
-        inject: (name: string) => { slotNames.push(name) },
-        register: (spec: unknown) => { registered.push(spec); return () => {} },
-      },
+/** A betterSidebar stand-in that records every tab it is asked to register. */
+function fakeBetterSidebar(tabs: Record<string, unknown>[]) {
+  return {
+    features: ['targetedOpen'],
+    registerTab: (descriptor: Record<string, unknown>) => {
+      tabs.push(descriptor)
+      return () => {}
+    },
   }
-  return { ctx, registered, slotNames }
+}
+
+/** The tab title is i18n-friendly: either a string or a () => string. */
+function titleOf(tab: Record<string, unknown>): unknown {
+  return typeof tab.title === 'function' ? (tab.title as () => string)() : tab.title
+}
+
+/**
+ * A ctx whose interesting surface is `effect`, `inject` (Cordis's dependency
+ * subscription) and `slots`. When a betterSidebar stand-in is supplied, `inject`
+ * fires its callback straight away — standing in for the service appearing —
+ * which is exactly how the plugin reaches the "+" menu in a real host.
+ */
+function makeCtx(options: { betterSidebar?: unknown }): {
+  ctx: Record<string, unknown>
+  slotNames: string[]
+  disposedSlots: string[]
+} {
+  const slotNames: string[] = []
+  const disposedSlots: string[] = []
+  const ctx: Record<string, unknown> = {
+    effect: (fn: () => unknown) => fn(),
+    inject: (deps: string[], cb: (scope: unknown) => void) => {
+      if (deps.indexOf('betterSidebar') >= 0 && options.betterSidebar !== undefined) {
+        cb({ betterSidebar: options.betterSidebar, effect: (fn: () => unknown) => fn() })
+      }
+    },
+    slots: {
+      inject: (name: string, fn: () => unknown) => {
+        slotNames.push(name)
+        fn()
+        return () => { disposedSlots.push(name) }
+      },
+      register: () => () => {},
+    },
+  }
+  return { ctx, slotNames, disposedSlots }
 }
 
 describe('client: Agent browser mount decision', () => {
-  it('registers a native better-sidebar tab when the service is available', () => {
+  it('registers the tab for the sidebar "+" menu once betterSidebar appears', () => {
     const tabs: Record<string, unknown>[] = []
-    const betterSidebar = {
-      features: ['targetedOpen'],
-      registerTab: (descriptor: Record<string, unknown>) => { tabs.push(descriptor); return () => {} },
-      openTab: () => {},
-    }
-    const { ctx } = makeCtx({ betterSidebar })
+    const { ctx, slotNames, disposedSlots } = makeCtx({ betterSidebar: fakeBetterSidebar(tabs) })
 
     loadClient().apply(ctx)
 
@@ -74,21 +98,24 @@ describe('client: Agent browser mount decision', () => {
     const tab = tabs[0]!
     expect(tab.id).toBe('dsh-browser-use:agent-browser')
     expect(typeof tab.component).toBe('function')
-    // Title is i18n-friendly: either a string or a () => string.
-    const title = typeof tab.title === 'function' ? (tab.title as () => string)() : tab.title
-    expect(title).toBe('Agent 浏览器')
+    expect(titleOf(tab)).toBe('Agent 浏览器')
+    // The floating fallback mounted first and then came back down, so nothing
+    // is left floating beside the native tab.
+    expect(slotNames).toContain('shell.overlay')
+    expect(disposedSlots).toContain('shell.overlay')
   })
 
-  it('falls back to the legacy shell.overlay panel when better-sidebar is absent', () => {
-    const { ctx, slotNames } = makeCtx({})
+  it('keeps the legacy shell.overlay panel when better-sidebar never appears', () => {
+    const { ctx, slotNames, disposedSlots } = makeCtx({})
 
     loadClient().apply(ctx)
 
     expect(slotNames).toContain('shell.overlay')
+    expect(disposedSlots).toHaveLength(0)
   })
 
   it('never throws when neither service is present', () => {
-    const ctx = { get: () => undefined, effect: (fn: () => unknown) => fn() }
+    const ctx = { effect: (fn: () => unknown) => fn(), inject: () => {} }
     expect(() => loadClient().apply(ctx)).not.toThrow()
   })
 })

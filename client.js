@@ -15,6 +15,11 @@ window.__ModuleLoader__.load({
 
     /** Host route streaming the agent's live page as MJPEG (see src/mirror.ts). */
     var FRAME_STREAM = '/browser-use/frame-stream'
+    /** Host routes behind the panel's tab strip. */
+    var TABS_ROUTE = '/browser-use/tabs'
+    var SWITCH_TAB_ROUTE = '/browser-use/switch-tab'
+    /** How often the tab strip re-reads the agent browser's tab list. */
+    var TABS_POLL_MS = 1500
 
     function postInput(payload) {
       fetch('/browser-use/input', {
@@ -57,6 +62,9 @@ window.__ModuleLoader__.load({
       var takeoverState = react.useState(false)
       var takeover = takeoverState[0]
       var setTakeover = takeoverState[1]
+      var tabsState = react.useState([])
+      var tabs = tabsState[0]
+      var setTabs = tabsState[1]
       var imgRef = react.useRef(null)
       var hoverRef = react.useRef(false)
       var lastMoveRef = react.useRef(0)
@@ -109,6 +117,41 @@ window.__ModuleLoader__.load({
           window.removeEventListener('resize', sync)
         }
       }, [visible])
+
+      // Tab strip: the panel only ever sees the frame, so it polls the host for
+      // the agent browser's tabs and lets the human switch pages from here. That
+      // is the reliable counterpart to following manual switches in the real
+      // Chrome, whose active-tab signal depends on that window being focused.
+      react.useEffect(function () {
+        if (!visible) return undefined
+        var cancelled = false
+        function load() {
+          fetch(TABS_ROUTE)
+            .then(function (res) { return res.json() })
+            .then(function (body) {
+              if (!cancelled && body && Array.isArray(body.tabs)) setTabs(body.tabs)
+            })
+            .catch(function () {})
+        }
+        load()
+        var timer = setInterval(load, TABS_POLL_MS)
+        return function () {
+          cancelled = true
+          clearInterval(timer)
+        }
+      }, [visible])
+
+      function switchTo(index) {
+        fetch(SWITCH_TAB_ROUTE, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ index: index }),
+        })
+          .then(function () { return fetch(TABS_ROUTE) })
+          .then(function (res) { return res.json() })
+          .then(function (body) { if (body && Array.isArray(body.tabs)) setTabs(body.tabs) })
+          .catch(function () {})
+      }
 
       function norm(e) {
         var el = imgRef.current
@@ -210,6 +253,52 @@ window.__ModuleLoader__.load({
         ),
       )
 
+      // Tab strip. The frame carries no tab metadata, so without this the panel
+      // is unusable for switching between the agent's pages — which is exactly
+      // what ego-browser's tab bar is for. Shown once there is a choice to make.
+      var strip =
+        tabs.length > 1
+          ? h(
+              'div',
+              {
+                style: {
+                  display: 'flex',
+                  gap: 4,
+                  padding: '4px 6px',
+                  overflowX: 'auto',
+                  flex: '0 0 auto',
+                  borderBottom: '1px solid rgba(255,255,255,0.08)',
+                },
+              },
+              tabs.map(function (tab) {
+                return h(
+                  'button',
+                  {
+                    key: tab.index,
+                    type: 'button',
+                    title: tab.url,
+                    onClick: function () { switchTo(tab.index) },
+                    style: {
+                      flex: '0 1 auto',
+                      maxWidth: 150,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      border: '1px solid ' + (tab.current ? 'rgba(255,255,255,0.45)' : 'rgba(255,255,255,0.12)'),
+                      background: tab.current ? 'rgba(255,255,255,0.16)' : 'transparent',
+                      color: '#eee',
+                      cursor: 'pointer',
+                      fontSize: 11,
+                      padding: '3px 8px',
+                      borderRadius: 6,
+                    },
+                  },
+                  tab.title || tab.url || 'Tab ' + tab.index,
+                )
+              }),
+            )
+          : null
+
       if (!visible) {
         // Unmounted intentionally: with no <img> there is no MJPEG consumer, so
         // the host route's `req.on('close')` stops the screencast.
@@ -217,6 +306,7 @@ window.__ModuleLoader__.load({
           'div',
           { style: hostStyle },
           bar,
+          strip,
           h(
             'div',
             {
@@ -237,6 +327,7 @@ window.__ModuleLoader__.load({
         'div',
         { style: hostStyle },
         bar,
+        strip,
         h('img', {
           ref: imgRef,
           src: FRAME_STREAM,

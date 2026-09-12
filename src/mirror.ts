@@ -74,6 +74,20 @@ export function registerMirrorRoutes(manager: BrowserSessionManager, webServer: 
     path: '/browser-use/viewport',
     handler: (req, res) => setViewport(manager, req, res),
   })
+
+  webServer.register({
+    name: 'browser-use-tabs',
+    kind: 'exact',
+    path: '/browser-use/tabs',
+    handler: (req, res) => listTabs(manager, res),
+  })
+
+  webServer.register({
+    name: 'browser-use-switch-tab',
+    kind: 'exact',
+    path: '/browser-use/switch-tab',
+    handler: (req, res) => switchTab(manager, req, res),
+  })
 }
 
 /** Stream the primary session's current page as MJPEG, following session swaps and target=_blank page rebinds. */
@@ -221,4 +235,40 @@ async function setViewport(manager: BrowserSessionManager, req: IncomingMessage,
 
   res.writeHead(200, { 'content-type': 'application/json' })
   res.end(JSON.stringify({ ok: true, width, height }))
+}
+
+/**
+ * List the agent browser's tabs for the observation panel's tab strip.
+ *
+ * The panel only ever sees the MJPEG frame, so it cannot discover tabs itself —
+ * it polls this. Uses the primary session WITHOUT creating one, so a poll before
+ * the agent has driven anything returns an empty list instead of launching a
+ * browser.
+ */
+async function listTabs(manager: BrowserSessionManager, res: ServerResponse): Promise<void> {
+  const session = manager.getPrimarySession()
+  const tabs = session === undefined ? [] : await session.listPages()
+  res.writeHead(200, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ ok: true, tabs }))
+}
+
+/** Switch the agent browser to one of its tabs (1-based), driven from the panel's tab strip. */
+async function switchTab(manager: BrowserSessionManager, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJson<{ index?: number }>(req)
+  const index = typeof body.index === 'number' && Number.isFinite(body.index) ? Math.round(body.index) : 0
+  if (index < 1) {
+    res.writeHead(400, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: false, error: 'index must be a 1-based tab number' }))
+    return
+  }
+  try {
+    const session = await manager.requireSession()
+    session.switchPage(index)
+  } catch (error) {
+    res.writeHead(404, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }))
+    return
+  }
+  res.writeHead(200, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ ok: true, index }))
 }

@@ -125,20 +125,30 @@ async function streamFrames(
     await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 85, everyNthFrame: 1, maxWidth: 1600, maxHeight: 900 })
   }
 
+  /** The page currently being screencast, so a redundant re-attach is skipped. */
+  let streaming: Page | undefined
+
   const follow = (session: BrowserSession): void => {
     if (closed) return
     disposePage?.()
-    // Re-attach when the AGENT moves pages and when the HUMAN pins a different tab
-    // to watch. The watched page is the panel's own state, independent of the
-    // agent's, so viewing another tab never steers the agent's session.
-    const reattach = (page: Page): void => void attach(page)
+    // Both subscriptions re-attach to whatever is WATCHED right now — never to the
+    // page the event happened to carry. The subtlety matters: the foreground-follow
+    // poll moves the AGENT's page, which fires onPageChange, and attaching to that
+    // page dragged the stream back off a tab the human had pinned — the panel then
+    // looked one click behind.
+    const reattach = (): void => {
+      const wanted = session.watchedPage()
+      if (wanted === streaming) return
+      streaming = wanted
+      void attach(wanted)
+    }
     const offPage = session.onPageChange(reattach)
     const offWatch = session.onWatchChange(reattach)
     disposePage = () => {
       offPage()
       offWatch()
     }
-    void attach(session.watchedPage())
+    reattach()
   }
 
   // Mirror the agent's session; while none exists, hold the stream open (the

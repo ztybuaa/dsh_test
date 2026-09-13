@@ -216,6 +216,14 @@ export class BrowserSession {
   private readonly jsonResponses: Array<{ url: string; body: unknown }> = []
   /** Listeners notified whenever the session rebinds to a new page (target=_blank etc.). */
   private readonly pageListeners: Array<(page: Page) => void> = []
+  /**
+   * The page the observation panel streams. `undefined` means "follow the agent's
+   * page"; setting it pins the panel to a tab the human picked WITHOUT moving the
+   * agent's page. The panel views; it must not steer.
+   */
+  private watched: Page | undefined
+  /** Listeners notified when the watched page changes, so the mirror re-attaches. */
+  private readonly watchListeners: Array<(page: Page) => void> = []
   /** Whether the human has taken over this session via the mirror. */
   private takeover = false
   /** Monotonic epoch, bumped on takeover so stale snapshots/refs are rejected. */
@@ -243,6 +251,7 @@ export class BrowserSession {
 
   /** Bind a page as the current one: capture its JSON responses and drop stale refs. */
   private attachPage(page: Page): void {
+    const previous = this.page
     this.page = page
     this.refs.clear()
     this.lastAxNodes = null
@@ -252,6 +261,55 @@ export class BrowserSession {
       page.on('close', () => this.handlePageClosed(page))
     }
     for (const listener of this.pageListeners) listener(page)
+    // The panel follows the agent unless the human pinned a different tab.
+    if (this.watched === undefined || this.watched === previous) {
+      this.watched = undefined
+      for (const listener of this.watchListeners) listener(page)
+    }
+  }
+
+  /** The page the observation panel should stream (the pinned tab, else the agent's page). */
+  watchedPage(): Page {
+    if (this.watched !== undefined && !this.watched.isClosed()) return this.watched
+    return this.page
+  }
+
+  /** Whether the panel is pinned to a specific tab rather than following the agent. */
+  get isWatchingPinned(): boolean {
+    return this.watched !== undefined && !this.watched.isClosed()
+  }
+
+  /**
+   * Pin the panel to a tab (1-based) — the human's "show me THIS one".
+   *
+   * Deliberately does NOT move `this.page` and deliberately does NOT call
+   * bringToFront(): switching what is watched is an observation, and raising the
+   * real browser window (or steering the agent's task) is exactly what the panel
+   * must never do. 1-based index into `context.pages()`.
+   */
+  watchPage(index: number): void {
+    const pages = this.context.pages()
+    const target = pages[index - 1]
+    if (target === undefined) {
+      throw new Error(`browser-use: tab ${index} does not exist (${pages.length} tab(s) open)`)
+    }
+    this.watched = target
+    for (const listener of this.watchListeners) listener(target)
+  }
+
+  /** Drop the pin so the panel follows the agent's page again. */
+  unwatchPage(): void {
+    this.watched = undefined
+    for (const listener of this.watchListeners) listener(this.page)
+  }
+
+  /** Subscribe to watched-page changes (the mirror re-attaches its screencast). Returns a disposer. */
+  onWatchChange(listener: (page: Page) => void): () => void {
+    this.watchListeners.push(listener)
+    return () => {
+      const i = this.watchListeners.indexOf(listener)
+      if (i >= 0) this.watchListeners.splice(i, 1)
+    }
   }
 
   /** When the current page closes, fall back to the newest remaining tab so the mirror keeps streaming. */
@@ -411,10 +469,10 @@ export class BrowserSession {
     await this.page.goto(url, { waitUntil: 'load', timeout: this.config.timeoutMs })
   }
 
-  /** List every open tab in the context, marking the current one. */
-  async listPages(): Promise<Array<{ index: number; title: string; url: string; current: boolean }>> {
+  /** List every open tab in the context, marking the agent's page and the watched one. */
+  async listPages(): Promise<Array<{ index: number; title: string; url: string; current: boolean; watched: boolean }>> {
     const pages = this.context.pages()
-    const out: Array<{ index: number; title: string; url: string; current: boolean }> = []
+    const out: Array<{ index: number; title: string; url: string; current: boolean; watched: boolean }> = []
     for (let i = 0; i < pages.length; i++) {
       const p = pages[i]
       out.push({
@@ -422,12 +480,21 @@ export class BrowserSession {
         title: (await p.title().catch(() => '')).slice(0, 120),
         url: p.url().slice(0, 300),
         current: p === this.page,
+        watched: p === this.watchedPage(),
       })
     }
     return out
   }
 
-  /** Switch the current page to the tab at `index` (1-based). */
+  /**
+   * Move the AGENT's session to the tab at `index` (1-based) — what the agent's
+   * own `browser_switch_tab` tool does.
+   *
+   * No `bringToFront()`: raising the real browser window is a side effect the
+   * agent's tab switch has no business causing, and the session's own bookkeeping
+   * does not need Chrome's active tab to agree (see watchPage for the panel's
+   * separate, side-effect-free view switch).
+   */
   switchPage(index: number): void {
     const pages = this.context.pages()
     const target = pages[index - 1]
@@ -435,9 +502,6 @@ export class BrowserSession {
       throw new Error(`browser-use: tab ${index} does not exist (${pages.length} tab(s) open)`)
     }
     this.attachPage(target)
-    // Agent-driven switches must also move Chrome's active tab, or the
-    // foreground-follow poll would immediately switch the session back.
-    void target.bringToFront().catch(() => {})
   }
 
   /**

@@ -13,8 +13,13 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     var react = require('react')
 
-    /** Host route streaming the agent's live page as MJPEG (see src/mirror.ts). */
+    /** Host route streaming the watched page as MJPEG (see src/mirror.ts). */
     var FRAME_STREAM = '/browser-use/frame-stream'
+    /** Tab list for the strip, and the panel's WATCH switch (never the agent's page). */
+    var TABS_ROUTE = '/browser-use/tabs'
+    var WATCH_ROUTE = '/browser-use/watch'
+    /** How often the strip re-reads the tab list. */
+    var TABS_POLL_MS = 1500
 
     function postInput(payload) {
       fetch('/browser-use/input', {
@@ -48,6 +53,9 @@ window.__ModuleLoader__.load({
       var takeoverState = react.useState(false)
       var takeover = takeoverState[0]
       var setTakeover = takeoverState[1]
+      var tabsState = react.useState([])
+      var tabs = tabsState[0]
+      var setTabs = tabsState[1]
       var imgRef = react.useRef(null)
       var hoverRef = react.useRef(false)
       var lastMoveRef = react.useRef(0)
@@ -87,6 +95,42 @@ window.__ModuleLoader__.load({
       // every drag (the frame visibly jumped 1600 -> 682 -> 819 wide), which is
       // the panel interfering with the browser it is supposed to observe. Aspect
       // mismatch is handled by letterboxing, and norm() accounts for it.
+
+      // Tab strip. Polls the host for the agent browser's tabs and pins the
+      // WATCH — the panel's own "show me this one" — instead of moving the agent's
+      // session. That separation is what ego-lite does with CaptureManager
+      // .switchTarget: viewing another tab must never steer the agent's task, nor
+      // raise the real browser window.
+      react.useEffect(function () {
+        if (!visible) return undefined
+        var cancelled = false
+        function load() {
+          fetch(TABS_ROUTE)
+            .then(function (res) { return res.json() })
+            .then(function (body) {
+              if (!cancelled && body && Array.isArray(body.tabs)) setTabs(body.tabs)
+            })
+            .catch(function () {})
+        }
+        load()
+        var timer = setInterval(load, TABS_POLL_MS)
+        return function () {
+          cancelled = true
+          clearInterval(timer)
+        }
+      }, [visible])
+
+      function watchTo(index) {
+        fetch(WATCH_ROUTE, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ index: index }),
+        })
+          .then(function () { return fetch(TABS_ROUTE) })
+          .then(function (res) { return res.json() })
+          .then(function (body) { if (body && Array.isArray(body.tabs)) setTabs(body.tabs) })
+          .catch(function () {})
+      }
 
       function norm(e) {
         var el = imgRef.current
@@ -188,6 +232,52 @@ window.__ModuleLoader__.load({
         ),
       )
 
+      // Tab strip: pins the WATCH (see the poll above). `watched` is the panel's
+      // page and is the highlighted one; `current` is the AGENT's page and only
+      // gets a dot, because the two are deliberately independent.
+      var strip =
+        tabs.length > 1
+          ? h(
+              'div',
+              {
+                style: {
+                  display: 'flex',
+                  gap: 4,
+                  padding: '4px 6px',
+                  overflowX: 'auto',
+                  flex: '0 0 auto',
+                  borderBottom: '1px solid rgba(255,255,255,0.08)',
+                },
+              },
+              tabs.map(function (tab) {
+                return h(
+                  'button',
+                  {
+                    key: tab.index,
+                    type: 'button',
+                    title: (tab.current ? '● agent 当前页 · ' : '') + (tab.url || ''),
+                    onClick: function () { watchTo(tab.index) },
+                    style: {
+                      flex: '0 1 auto',
+                      maxWidth: 150,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      border: '1px solid ' + (tab.watched ? 'rgba(255,255,255,0.45)' : 'rgba(255,255,255,0.12)'),
+                      background: tab.watched ? 'rgba(255,255,255,0.16)' : 'transparent',
+                      color: '#eee',
+                      cursor: 'pointer',
+                      fontSize: 11,
+                      padding: '3px 8px',
+                      borderRadius: 6,
+                    },
+                  },
+                  (tab.current ? '● ' : '') + (tab.title || tab.url || 'Tab ' + tab.index),
+                )
+              }),
+            )
+          : null
+
       // The frame lives in a DEFINITE box. An <img> left to size itself takes the
       // frame's intrinsic width, and because that width is what the viewport sync
       // feeds back to the page, the panel locks at its first size and never grows
@@ -242,7 +332,7 @@ window.__ModuleLoader__.load({
             ),
       )
 
-      return h('div', { style: hostStyle }, bar, box)
+      return h('div', { style: hostStyle }, bar, strip, box)
     }
 
     /** Descriptor of the sidebar tab this plugin contributes. */

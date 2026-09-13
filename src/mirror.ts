@@ -67,6 +67,20 @@ export function registerMirrorRoutes(manager: BrowserSessionManager, webServer: 
     path: '/browser-use/takeover',
     handler: (req, res) => setTakeover(manager, req, res),
   })
+
+  webServer.register({
+    name: 'browser-use-tabs',
+    kind: 'exact',
+    path: '/browser-use/tabs',
+    handler: (req, res) => listTabs(manager, res),
+  })
+
+  webServer.register({
+    name: 'browser-use-watch',
+    kind: 'exact',
+    path: '/browser-use/watch',
+    handler: (req, res) => watchTab(manager, req, res),
+  })
 }
 
 /** Stream the primary session's current page as MJPEG, following session swaps and target=_blank page rebinds. */
@@ -114,10 +128,17 @@ async function streamFrames(
   const follow = (session: BrowserSession): void => {
     if (closed) return
     disposePage?.()
-    // The session keeps its own page pointed at the browser's foreground tab
-    // (see BrowserSession's follow poll); the mirror just re-attaches on change.
-    disposePage = session.onPageChange((page) => void attach(page))
-    void attach(session.page)
+    // Re-attach when the AGENT moves pages and when the HUMAN pins a different tab
+    // to watch. The watched page is the panel's own state, independent of the
+    // agent's, so viewing another tab never steers the agent's session.
+    const reattach = (page: Page): void => void attach(page)
+    const offPage = session.onPageChange(reattach)
+    const offWatch = session.onWatchChange(reattach)
+    disposePage = () => {
+      offPage()
+      offWatch()
+    }
+    void attach(session.watchedPage())
   }
 
   // Mirror the agent's session; while none exists, hold the stream open (the
@@ -154,19 +175,22 @@ async function relayInput(
   }
   const mx = typeof body.x === 'number' ? body.x * frameSize.width : undefined
   const my = typeof body.y === 'number' ? body.y * frameSize.height : undefined
+  // The human operates what they SEE — the watched tab, which is not necessarily
+  // the tab the agent is working on.
+  const page = session.watchedPage()
 
   if (body.type === 'down' && mx !== undefined && my !== undefined) {
-    await session.page.mouse.move(mx, my)
-    await session.page.mouse.down()
+    await page.mouse.move(mx, my)
+    await page.mouse.down()
   } else if (body.type === 'move' && mx !== undefined && my !== undefined) {
-    await session.page.mouse.move(mx, my)
+    await page.mouse.move(mx, my)
   } else if (body.type === 'up' && mx !== undefined && my !== undefined) {
-    await session.page.mouse.move(mx, my)
-    await session.page.mouse.up()
+    await page.mouse.move(mx, my)
+    await page.mouse.up()
   } else if (body.type === 'scroll' && typeof body.deltaY === 'number') {
-    await session.page.mouse.wheel(0, body.deltaY)
+    await page.mouse.wheel(0, body.deltaY)
   } else if (body.type === 'key' && typeof body.key === 'string') {
-    await session.page.keyboard.press(body.key)
+    await page.keyboard.press(body.key)
   }
 
   res.writeHead(200, { 'content-type': 'application/json' })
@@ -183,4 +207,44 @@ async function setTakeover(manager: BrowserSessionManager, req: IncomingMessage,
 
   res.writeHead(200, { 'content-type': 'application/json' })
   res.end(JSON.stringify({ ok: true, takeover: session.isTakeover }))
+}
+
+/**
+ * List the agent browser's tabs for the panel's tab strip.
+ *
+ * The panel only ever sees the frame, so it cannot discover tabs itself. Uses the
+ * primary session WITHOUT creating one, so a poll before the agent drives anything
+ * returns an empty list instead of launching a browser. Each entry carries
+ * `current` (the AGENT's page) and `watched` (the PANEL's page) — two different
+ * things, which is the whole point of the watch state.
+ */
+async function listTabs(manager: BrowserSessionManager, res: ServerResponse): Promise<void> {
+  const session = manager.getPrimarySession()
+  const tabs = session === undefined ? [] : await session.listPages()
+  res.writeHead(200, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ ok: true, tabs }))
+}
+
+/**
+ * Pin the panel to a tab (1-based). Moves the WATCH, not the agent's session, and
+ * never raises the browser window.
+ */
+async function watchTab(manager: BrowserSessionManager, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJson<{ index?: number }>(req)
+  const index = typeof body.index === 'number' && Number.isFinite(body.index) ? Math.round(body.index) : 0
+  if (index < 1) {
+    res.writeHead(400, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: false, error: 'index must be a 1-based tab number' }))
+    return
+  }
+  try {
+    const session = await manager.requireSession()
+    session.watchPage(index)
+  } catch (error) {
+    res.writeHead(404, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }))
+    return
+  }
+  res.writeHead(200, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ ok: true, index }))
 }

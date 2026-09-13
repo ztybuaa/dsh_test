@@ -350,4 +350,69 @@ describe('BrowserSessionManager', () => {
       await manager.dispose()
     }
   })
+
+  it('pins the watched tab without moving the agent page (the panel views, it does not steer)', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    try {
+      const session = await manager.requireSession({ id: 'a' })
+      await session.navigate(base)
+      const first = session.page
+
+      // A second tab. The session FOLLOWS a newly created page (target=_blank
+      // semantics), so the agent ends up on tab 2 while tab 1 still exists.
+      const second = await first.context().newPage()
+      await second.goto(`${base}/popup`)
+      const agentPage = session.page
+      expect(agentPage).toBe(second)
+
+      const before = await session.listPages()
+      expect(before).toHaveLength(2)
+      // While following, the panel watches wherever the agent is.
+      expect(before[0]).toMatchObject({ current: false, watched: false })
+      expect(before[1]).toMatchObject({ current: true, watched: true })
+
+      const notices: string[] = []
+      session.onWatchChange((page) => notices.push(page.url()))
+      session.watchPage(1)
+
+      // The whole point: the agent's page is untouched, only the watch moved.
+      expect(session.page).toBe(agentPage)
+      expect(session.watchedPage()).toBe(first)
+      expect(session.isWatchingPinned).toBe(true)
+      expect(notices).toHaveLength(1)
+
+      const after = await session.listPages()
+      expect(after[0]).toMatchObject({ current: false, watched: true })
+      expect(after[1]).toMatchObject({ current: true, watched: false })
+
+      session.unwatchPage()
+      expect(session.watchedPage()).toBe(agentPage)
+      expect(session.isWatchingPinned).toBe(false)
+    } finally {
+      await manager.dispose()
+    }
+  })
+
+  it('leaves the agent page where it is when the agent switches tabs, and drops the panel pin', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    try {
+      const session = await manager.requireSession({ id: 'a' })
+      await session.navigate(base)
+      const first = session.page
+      const second = await first.context().newPage()
+      await second.goto(`${base}/popup`)
+
+      session.watchPage(2)
+      expect(session.watchedPage()).toBe(second)
+
+      // The agent switches back: the panel follows the agent again (the pin was on
+      // the page the agent just left), and no window is raised.
+      session.switchPage(1)
+      expect(session.page).toBe(first)
+      expect(session.watchedPage()).toBe(first)
+      expect(session.isWatchingPinned).toBe(false)
+    } finally {
+      await manager.dispose()
+    }
+  })
 })

@@ -23,12 +23,40 @@ window.__ModuleLoader__.load({
     /** How often the strip re-reads the tab list. */
     var TABS_POLL_MS = 1500
 
-    function postInput(payload) {
-      fetch('/browser-use/input', {
+    /**
+     * Post one input intention to the host.
+     *
+     * Never throws, but it does REPORT. The host answers 409 when nobody holds
+     * takeover and 500 when a dispatch fails, and swallowing either is what made the
+     * panel look simply dead when it was in fact being refused.
+     */
+    function postInput(payload, onFailure) {
+      return fetch('/browser-use/input', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(payload),
-      }).catch(function () {})
+      })
+        .then(readFailure)
+        .catch(function (error) { return { status: 0, error: describe(error) } })
+        .then(function (failure) {
+          if (failure && onFailure) onFailure(failure)
+          return failure
+        })
+    }
+
+    /** Turn a non-2xx response into {status, error}; resolve null when it succeeded. */
+    function readFailure(res) {
+      if (res.ok) return null
+      return res
+        .json()
+        .catch(function () { return {} })
+        .then(function (body) {
+          return { status: res.status, error: body && body.error ? String(body.error) : 'HTTP ' + res.status }
+        })
+    }
+
+    function describe(error) {
+      return String(error && error.message ? error.message : error)
     }
 
     function postTakeover(next) {
@@ -43,10 +71,141 @@ window.__ModuleLoader__.load({
      * Ask the host to raise the real Chrome window (and restore it first — it is
      * launched with --start-minimized). Deliberately wired to a button and nothing
      * else: the panel observes the browser, so it must never move the window on its
-     * own. Nothing is awaited — a 404 just means no browser has been driven yet.
+     * own. Resolves to null on success, or to {status, error}.
      */
     function showWindow() {
-      fetch(SHOW_ROUTE, { method: 'POST' }).catch(function () {})
+      return fetch(SHOW_ROUTE, { method: 'POST' })
+        .then(readFailure)
+        .catch(function (error) { return { status: 0, error: describe(error) } })
+    }
+
+    /** CDP modifier bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8. */
+    function mods(e) {
+      return (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0)
+    }
+
+    /**
+     * Text and key entry for the panel.
+     *
+     * Ported from ego-lite's `createKeyboardProxy`, because the obvious version — one
+     * `key` POST per document keydown — cannot type anything a key NAME cannot
+     * express: no IME (so no Chinese or Japanese at all), no modifiers, and Shift+2
+     * arrives as "2". A hidden textarea takes real focus instead, so the browser
+     * produces genuine `beforeinput` and composition events: printable text leaves as
+     * `insertText`, and only shortcuts and control keys become key events.
+     */
+    function createKeyboardProxy(send) {
+      var input = document.createElement('textarea')
+      input.tabIndex = -1
+      input.setAttribute('autocomplete', 'off')
+      input.setAttribute('autocapitalize', 'off')
+      input.setAttribute('spellcheck', 'false')
+      input.style.cssText =
+        'position:fixed;z-index:-1;width:1px;height:1px;opacity:0;pointer-events:none;resize:none;padding:0;border:0;left:0;top:0;'
+      document.body.appendChild(input)
+
+      var composing = false
+      var pressed = {}
+      var lastCompositionText = ''
+      var lastCompositionAt = 0
+
+      function keyId(e) {
+        return e.code || e.key
+      }
+      function keyPayload(e) {
+        return {
+          key: e.key,
+          code: e.code || '',
+          modifiers: mods(e),
+          autoRepeat: e.repeat === true,
+          windowsVirtualKeyCode: Number(e.keyCode || e.which || 0),
+        }
+      }
+      function releaseAll() {
+        Object.keys(pressed).forEach(function (id) {
+          send('keyUp', Object.assign({}, pressed[id], { autoRepeat: false }))
+        })
+        pressed = {}
+      }
+
+      input.addEventListener('compositionstart', function (e) {
+        composing = true
+        e.stopPropagation()
+      })
+      input.addEventListener('compositionend', function (e) {
+        composing = false
+        e.stopPropagation()
+        if (e.data) {
+          lastCompositionText = e.data
+          lastCompositionAt = Date.now()
+          send('insertText', { text: e.data })
+        }
+        window.setTimeout(function () { input.value = '' }, 0)
+      })
+      input.addEventListener('beforeinput', function (e) {
+        e.stopPropagation()
+        if (composing || /Composition/i.test(e.inputType || '')) return
+        // compositionend already sent this text; beforeinput repeats it immediately after.
+        if (e.data && e.data === lastCompositionText && Date.now() - lastCompositionAt < 100) {
+          e.preventDefault()
+          return
+        }
+        if (e.data) {
+          e.preventDefault()
+          send('insertText', { text: e.data })
+          input.value = ''
+        }
+      })
+      input.addEventListener('paste', function (e) {
+        var text = e.clipboardData && e.clipboardData.getData('text/plain')
+        if (!text) return
+        e.preventDefault()
+        e.stopPropagation()
+        send('insertText', { text: text })
+        input.value = ''
+      })
+      input.addEventListener('keydown', function (e) {
+        e.stopPropagation()
+        if (composing || e.key === 'Process' || e.key === 'Dead') return
+        // AltGr reports as Ctrl+Alt on Windows and must not be treated as a shortcut.
+        if (e.getModifierState && e.getModifierState('AltGraph') && e.key.length === 1) return
+        var isShortcut = e.ctrlKey || e.metaKey || e.altKey
+        var isControl = e.key.length > 1
+        // A printable key is left to beforeinput -> insertText, or it would be typed twice.
+        if (!isShortcut && !isControl) return
+        if ((e.ctrlKey || e.metaKey) && String(e.key).toLowerCase() === 'v') return
+        e.preventDefault()
+        var payload = keyPayload(e)
+        pressed[keyId(e)] = payload
+        send('keyDown', payload)
+      })
+      input.addEventListener('keyup', function (e) {
+        e.stopPropagation()
+        var payload = pressed[keyId(e)]
+        if (!payload) return
+        e.preventDefault()
+        delete pressed[keyId(e)]
+        send('keyUp', keyPayload(e))
+      })
+      input.addEventListener('blur', releaseAll)
+
+      return {
+        focus: function () {
+          try {
+            input.focus({ preventScroll: true })
+          } catch (_) {
+            input.focus()
+          }
+        },
+        blur: function () {
+          releaseAll()
+          input.blur()
+        },
+        destroy: function () {
+          releaseAll()
+          if (input.parentNode) input.parentNode.removeChild(input)
+        },
+      }
     }
 
     /**
@@ -69,36 +228,91 @@ window.__ModuleLoader__.load({
       var tabs = tabsState[0]
       var setTabs = tabsState[1]
       var imgRef = react.useRef(null)
-      var hoverRef = react.useRef(false)
       var lastMoveRef = react.useRef(0)
+      var dragRef = react.useRef(null)
+      var proxyRef = react.useRef(null)
+      var noteTimerRef = react.useRef(undefined)
+      var noteState = react.useState('')
+      var note = noteState[0]
+      var setNote = noteState[1]
+
+      function flashNote(text) {
+        setNote(text)
+        if (noteTimerRef.current) window.clearTimeout(noteTimerRef.current)
+        noteTimerRef.current = window.setTimeout(function () { setNote('') }, 6000)
+      }
+
+      /**
+       * Surface a failed host call instead of doing nothing.
+       *
+       * 405 gets its own line because it has exactly one cause and it is not the
+       * user's fault: the client half is re-read from disk on every browser refresh,
+       * while the host half only reloads when DSH restarts. A newly added route
+       * therefore looks broken until the next restart, which is precisely how the
+       * 显示窗口 button first appeared dead.
+       */
+      function reportFailure(failure) {
+        if (!failure) return
+        if (failure.status === 405) {
+          flashNote('宿主端没有这条路由 —— 需要重启 DSH（客户端随刷新重载，宿主不会）')
+          return
+        }
+        if (failure.status === 409) {
+          flashNote('未接管：先点「接管浏览器」')
+          return
+        }
+        flashNote('操作失败：' + failure.error)
+      }
 
       function toggleTakeover() {
         var next = !takeover
         postTakeover(next)
           .then(function () { setTakeover(next) })
-          .catch(function () {})
+          .catch(function (error) { flashNote('切换接管失败：' + describe(error)) })
       }
 
+      function onShowWindow() {
+        showWindow().then(function (failure) {
+          if (failure) reportFailure(failure)
+          else flashNote('已把浏览器窗口抬到最前')
+        })
+      }
+
+      // A native listener rather than React's onWheel: React attaches wheel passively
+      // at the root, where preventDefault() is ignored and the sidebar scrolls instead
+      // of the page.
       react.useEffect(function () {
         var el = imgRef.current
         if (el === null) return undefined
         function onWheel(e) {
           if (!takeover) return
           e.preventDefault()
-          postInput({ type: 'scroll', deltaY: e.deltaY })
+          e.stopPropagation()
+          var p = norm(e)
+          postInput({ type: 'mouseWheel', x: p.x, y: p.y, deltaX: e.deltaX || 0, deltaY: e.deltaY || 0 }, reportFailure)
         }
         el.addEventListener('wheel', onWheel, { passive: false })
         return function () { el.removeEventListener('wheel', onWheel) }
       }, [visible, takeover])
 
+      // The keyboard proxy belongs to the panel's lifetime; takeover only decides
+      // whether it holds focus. Focus is taken on pointer-down (below) and never on
+      // render, so an open panel does not steal keystrokes from the DSH composer.
       react.useEffect(function () {
-        function onKeyDown(e) {
-          if (!takeover || !hoverRef.current) return
-          if (['Shift', 'Control', 'Alt', 'Meta'].indexOf(e.key) >= 0) return
-          postInput({ type: 'key', key: e.key })
+        var proxy = createKeyboardProxy(function (type, params) {
+          postInput(Object.assign({ type: type }, params), reportFailure)
+        })
+        proxyRef.current = proxy
+        return function () {
+          proxyRef.current = null
+          proxy.destroy()
         }
-        document.addEventListener('keydown', onKeyDown)
-        return function () { document.removeEventListener('keydown', onKeyDown) }
+      }, [])
+
+      react.useEffect(function () {
+        if (takeover) return undefined
+        if (proxyRef.current !== null) proxyRef.current.blur()
+        return undefined
       }, [takeover])
 
       // NO viewport sync. This panel is a convenience viewer for the agent's
@@ -161,25 +375,49 @@ window.__ModuleLoader__.load({
         return { x: (e.clientX - left) / rw, y: (e.clientY - top) / rh }
       }
 
-      function onMouseDown(e) {
-        if (!takeover) return
+      function onPointerDown(e) {
+        if (!takeover || e.button !== 0) return
+        e.preventDefault()
+        // Capture, so a drag keeps reporting after the pointer leaves the frame.
+        try {
+          e.currentTarget.setPointerCapture(e.pointerId)
+        } catch (_) {}
+        if (proxyRef.current !== null) proxyRef.current.focus()
         var p = norm(e)
-        postInput({ type: 'down', x: p.x, y: p.y })
+        dragRef.current = { pointerId: e.pointerId, at: p }
+        postInput(
+          { type: 'mousePressed', x: p.x, y: p.y, button: 'left', buttons: 1, clickCount: e.detail || 1, modifiers: mods(e) },
+          reportFailure,
+        )
       }
 
-      function onMouseMove(e) {
+      function onPointerMove(e) {
         if (!takeover) return
-        var now = Date.now()
-        if (now - lastMoveRef.current < 30) return
-        lastMoveRef.current = now
+        var drag = dragRef.current
+        var dragging = drag !== null && drag.pointerId === e.pointerId
+        if (!dragging) {
+          // ego's inputBusy guard: drop a move that arrives before the last one landed.
+          var now = Date.now()
+          if (now - lastMoveRef.current < 24) return
+          lastMoveRef.current = now
+        }
         var p = norm(e)
-        postInput({ type: 'move', x: p.x, y: p.y })
+        if (dragging) drag.at = p
+        // `buttons` is what tells the page a drag is in progress; without it the page
+        // sees a plain hover and text selection never starts.
+        postInput({ type: 'mouseMoved', x: p.x, y: p.y, buttons: dragging ? 1 : 0 }, reportFailure)
       }
 
-      function onMouseUp(e) {
-        if (!takeover) return
-        var p = norm(e)
-        postInput({ type: 'up', x: p.x, y: p.y })
+      /** Release at the last dragged position — the page never saw the pointer leave. */
+      function endDrag(e) {
+        var drag = dragRef.current
+        if (drag === null || drag.pointerId !== e.pointerId) return
+        dragRef.current = null
+        var p = drag.at
+        postInput(
+          { type: 'mouseReleased', x: p.x, y: p.y, button: 'left', buttons: 0, clickCount: 1, modifiers: mods(e) },
+          reportFailure,
+        )
       }
 
       var hostStyle = floating
@@ -232,7 +470,7 @@ window.__ModuleLoader__.load({
             'button',
             {
               type: 'button',
-              onClick: showWindow,
+              onClick: onShowWindow,
               title: '把真实 Chrome 窗口抬到最前，并停在面板正在看的那个标签页',
               style: {
                 border: '1px solid rgba(255,255,255,0.25)',
@@ -331,11 +569,12 @@ window.__ModuleLoader__.load({
           ? h('img', {
               ref: imgRef,
               src: FRAME_STREAM,
-              onMouseDown: onMouseDown,
-              onMouseMove: onMouseMove,
-              onMouseUp: onMouseUp,
-              onMouseEnter: function () { hoverRef.current = true },
-              onMouseLeave: function () { hoverRef.current = false },
+              draggable: false,
+              onPointerDown: onPointerDown,
+              onPointerMove: onPointerMove,
+              onPointerUp: endDrag,
+              onPointerCancel: endDrag,
+              onLostPointerCapture: endDrag,
               style: {
                 position: 'absolute',
                 top: 0,
@@ -344,6 +583,8 @@ window.__ModuleLoader__.load({
                 height: '100%',
                 objectFit: 'contain',
                 display: 'block',
+                userSelect: 'none',
+                touchAction: 'none',
                 cursor: takeover ? 'crosshair' : 'default',
               },
             })
@@ -366,7 +607,26 @@ window.__ModuleLoader__.load({
             ),
       )
 
-      return h('div', { style: hostStyle }, bar, strip, box)
+      // Failures of host calls are reported here. Silence was the real problem: a
+      // refused or unrouted call looked exactly like a button that does nothing.
+      var noteBar = note
+        ? h(
+            'div',
+            {
+              style: {
+                flex: '0 0 auto',
+                padding: '6px 10px',
+                fontSize: 12,
+                color: '#f0b429',
+                background: 'rgba(240,180,41,0.10)',
+                borderBottom: '1px solid rgba(255,255,255,0.08)',
+              },
+            },
+            note,
+          )
+        : null
+
+      return h('div', { style: hostStyle }, bar, noteBar, strip, box)
     }
 
     /** Descriptor of the sidebar tab this plugin contributes. */

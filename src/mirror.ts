@@ -25,6 +25,21 @@ interface ScreencastFrame {
   metadata: { deviceWidth: number; deviceHeight: number }
 }
 
+/** Downscale cap for both the screencast and the backstop screenshots. */
+const MAX_FRAME_WIDTH = 1600
+const MAX_FRAME_HEIGHT = 900
+
+/**
+ * How long the stream may go without a frame before it takes a screenshot itself.
+ *
+ * `Page.startScreencast` only pushes on paint, so a target that is not repainting —
+ * a background tab, a static document — emits nothing at all. Without this the panel
+ * keeps rendering the last frame of whatever target it was attached to before, which
+ * looks exactly like "switching tabs does nothing". ego-browser's CDP backend carries
+ * the same backstop (`#scheduleBackstop` / `cdpBackstopIntervalMs`) for this reason.
+ */
+const BACKSTOP_MS = 1000
+
 /** One relayed input event posted by the client panel. */
 interface InputEvent {
   type: 'down' | 'move' | 'up' | 'scroll' | 'key'
@@ -98,31 +113,107 @@ async function streamFrames(
 
   let cdp: CDPSession | undefined
   let disposePage: (() => void) | undefined
+  let backstop: ReturnType<typeof setInterval> | undefined
+  let retry: ReturnType<typeof setTimeout> | undefined
+  let lastFrameAt = 0
   let closed = false
+
+  const pushFrame = (data: string): void => {
+    if (closed) return
+    const buf = Buffer.from(data, 'base64')
+    lastFrameAt = Date.now()
+    res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${buf.length}\r\n\r\n`)
+    res.write(buf)
+    res.write('\r\n')
+  }
+
+  const stopBackstop = (): void => {
+    if (backstop !== undefined) clearInterval(backstop)
+    backstop = undefined
+  }
+
+  /**
+   * Refresh the CSS viewport size that relayed input is scaled against.
+   *
+   * The client normalizes a click through the rendered image (0..1) and this module
+   * multiplies it back up, so the multiplier has to be the page's CSS viewport — not
+   * the image's pixel size, which the `maxWidth` cap shrinks on wide windows. ego
+   * keeps the same two numbers apart for the same reason.
+   */
+  const refreshViewport = async (session: CDPSession): Promise<number> => {
+    const metrics = (await session.send('Page.getLayoutMetrics')) as unknown as {
+      cssVisualViewport?: { clientWidth?: number; clientHeight?: number }
+    }
+    const width = metrics.cssVisualViewport?.clientWidth
+    const height = metrics.cssVisualViewport?.clientHeight
+    if (typeof width === 'number' && width > 0 && typeof height === 'number' && height > 0) {
+      frameSize.width = Math.round(width)
+      frameSize.height = Math.round(height)
+    }
+    return frameSize.width
+  }
+
+  /** One screenshot, used both to show a fresh target at once and as the idle backstop. */
+  const forceFrame = async (session: CDPSession): Promise<void> => {
+    if (closed || session !== cdp) return
+    const width = await refreshViewport(session)
+    const scale = width > MAX_FRAME_WIDTH ? MAX_FRAME_WIDTH / width : 1
+    const shot = await session.send('Page.captureScreenshot', {
+      format: 'jpeg',
+      quality: 85,
+      captureBeyondViewport: false,
+      ...(frameSize.width > 0 && frameSize.height > 0
+        ? { clip: { x: 0, y: 0, width: frameSize.width, height: frameSize.height, scale } }
+        : {}),
+    })
+    if (closed || session !== cdp) return
+    pushFrame(shot.data)
+  }
+
+  const startBackstop = (session: CDPSession): void => {
+    stopBackstop()
+    backstop = setInterval(() => {
+      if (closed || Date.now() - lastFrameAt < BACKSTOP_MS) return
+      void forceFrame(session).catch(() => {})
+    }, BACKSTOP_MS)
+  }
 
   const attach = async (page: Page): Promise<void> => {
     if (closed) return
+    stopBackstop()
     if (cdp !== undefined) {
       cdp.send('Page.stopScreencast').catch(() => {})
       cdp.detach().catch(() => {})
       cdp = undefined
     }
-    cdp = await page.context().newCDPSession(page)
-    cdp.on('Page.screencastFrame', (raw) => {
+    const session = await page.context().newCDPSession(page)
+    if (closed) {
+      session.detach().catch(() => {})
+      return
+    }
+    cdp = session
+    session.on('Page.screencastFrame', (raw) => {
       const frame = raw as unknown as ScreencastFrame
       // Ack first so Chrome's flow control never throttles the next frame.
-      cdp?.send('Page.screencastFrameAck', { sessionId: frame.sessionId }).catch(() => {})
-      frameSize.width = frame.metadata.deviceWidth
-      frameSize.height = frame.metadata.deviceHeight
-      const buf = Buffer.from(frame.data, 'base64')
-      res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${buf.length}\r\n\r\n`)
-      res.write(buf)
-      res.write('\r\n')
+      session.send('Page.screencastFrameAck', { sessionId: frame.sessionId }).catch(() => {})
+      // A frame from a session we have already replaced belongs to the old target.
+      if (session !== cdp) return
+      pushFrame(frame.data)
     })
     // Downscale to the mirror panel's size (the client <img> is ~1240px wide);
     // 1600x900 + quality 85 keeps the text crisp while staying below the
     // full-resolution encode cost that caused the earlier latency.
-    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 85, everyNthFrame: 1, maxWidth: 1600, maxHeight: 900 })
+    await session.send('Page.startScreencast', {
+      format: 'jpeg',
+      quality: 85,
+      everyNthFrame: 1,
+      maxWidth: MAX_FRAME_WIDTH,
+      maxHeight: MAX_FRAME_HEIGHT,
+    })
+    // `startScreencast` waits for the next paint to emit anything, so show the new
+    // target now instead of whenever it happens to repaint.
+    await forceFrame(session)
+    startBackstop(session)
   }
 
   /** The page currently being screencast, so a redundant re-attach is skipped. */
@@ -137,10 +228,19 @@ async function streamFrames(
     // page dragged the stream back off a tab the human had pinned — the panel then
     // looked one click behind.
     const reattach = (): void => {
+      if (closed) return
       const wanted = session.watchedPage()
       if (wanted === streaming) return
       streaming = wanted
-      void attach(wanted)
+      void attach(wanted).catch(() => {
+        // A switch can race a navigation or a tab close. Leaving `streaming` set here
+        // would pin the stream to a target we never attached to — the panel would sit
+        // on the previous tab's last frame forever, with no event left to retry it.
+        if (streaming === wanted) streaming = undefined
+        if (closed) return
+        clearTimeout(retry)
+        retry = setTimeout(reattach, 300)
+      })
     }
     const offPage = session.onPageChange(reattach)
     const offWatch = session.onWatchChange(reattach)
@@ -161,6 +261,8 @@ async function streamFrames(
     closed = true
     disposePrimary()
     disposePage?.()
+    stopBackstop()
+    clearTimeout(retry)
     if (cdp !== undefined) {
       cdp.send('Page.stopScreencast').catch(() => {})
       cdp.detach().catch(() => {})

@@ -505,6 +505,35 @@ export class BrowserSession {
   }
 
   /**
+   * Bring the real Chrome window to the front and show the WATCHED tab.
+   *
+   * The one place this plugin is allowed to disturb the browser, and only because a
+   * human asked for it. Observation itself never activates a target — ego-browser's
+   * capture path contains no `Target.activateTarget` and no `bringToFront` either,
+   * and its only visibility requirement (the FFmpeg backend) is met by throwing
+   * rather than by raising the window.
+   *
+   * The window is restored before the tab is activated: the browser launches with
+   * `--start-minimized`, and activating a tab in a minimized window leaves it sitting
+   * in the taskbar.
+   */
+  async showWindow(): Promise<void> {
+    const page = this.watchedPage()
+    try {
+      const cdp = await this.context.newCDPSession(page)
+      try {
+        const { windowId } = await cdp.send('Browser.getWindowForTarget', {})
+        await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } })
+      } finally {
+        await cdp.detach().catch(() => {})
+      }
+    } catch {
+      // A platform that refuses window bounds still gets the tab activation below.
+    }
+    await page.bringToFront()
+  }
+
+  /**
    * 1-based index of the browser's foreground tab, or undefined when it cannot
    * be determined. `document.visibilityState` is NOT usable here: Playwright
    * launches Chrome with backgrounding disabled, so every tab reports `visible`.

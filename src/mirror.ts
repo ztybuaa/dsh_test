@@ -96,6 +96,13 @@ export function registerMirrorRoutes(manager: BrowserSessionManager, webServer: 
     path: '/browser-use/watch',
     handler: (req, res) => watchTab(manager, req, res),
   })
+
+  webServer.register({
+    name: 'browser-use-show',
+    kind: 'exact',
+    path: '/browser-use/show',
+    handler: (_req, res) => showBrowser(manager, res),
+  })
 }
 
 /** Stream the primary session's current page as MJPEG, following session swaps and target=_blank page rebinds. */
@@ -359,4 +366,31 @@ async function watchTab(manager: BrowserSessionManager, req: IncomingMessage, re
   }
   res.writeHead(200, { 'content-type': 'application/json' })
   res.end(JSON.stringify({ ok: true, index }))
+}
+
+/**
+ * Bring the real browser window to the front, on the watched tab.
+ *
+ * Only ever reached because the human pressed a button in the panel. Showing the
+ * window automatically would contradict the whole point of the panel — observation
+ * that never disturbs the browser — so nothing in this module calls it on its own.
+ * Uses the primary session WITHOUT creating one: there is nothing to show before the
+ * agent has driven anything, and launching a browser to reveal it would be absurd.
+ */
+async function showBrowser(manager: BrowserSessionManager, res: ServerResponse): Promise<void> {
+  const session = manager.getPrimarySession()
+  if (session === undefined) {
+    res.writeHead(404, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: false, error: 'no browser to show yet' }))
+    return
+  }
+  try {
+    await session.showWindow()
+  } catch (error) {
+    res.writeHead(500, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }))
+    return
+  }
+  res.writeHead(200, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ ok: true }))
 }

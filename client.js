@@ -18,6 +18,8 @@ window.__ModuleLoader__.load({
     /** Tab list for the strip, and the panel's WATCH switch (never the agent's page). */
     var TABS_ROUTE = '/browser-use/tabs'
     var WATCH_ROUTE = '/browser-use/watch'
+    /** The one deliberate exception to "observation never disturbs the browser". */
+    var SHOW_ROUTE = '/browser-use/show'
     /** How often the strip re-reads the tab list. */
     var TABS_POLL_MS = 1500
 
@@ -35,6 +37,16 @@ window.__ModuleLoader__.load({
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ takeover: next }),
       })
+    }
+
+    /**
+     * Ask the host to raise the real Chrome window (and restore it first — it is
+     * launched with --start-minimized). Deliberately wired to a button and nothing
+     * else: the panel observes the browser, so it must never move the window on its
+     * own. Nothing is awaited — a 404 just means no browser has been driven yet.
+     */
+    function showWindow() {
+      fetch(SHOW_ROUTE, { method: 'POST' }).catch(function () {})
     }
 
     /**
@@ -214,21 +226,43 @@ window.__ModuleLoader__.load({
         },
         h('span', { style: { fontWeight: 600 } }, takeover ? '人接管中' : 'Agent 浏览器'),
         h(
-          'button',
-          {
-            type: 'button',
-            onClick: toggleTakeover,
-            style: {
-              border: '1px solid rgba(255,255,255,0.25)',
-              background: takeover ? '#f0b429' : 'transparent',
-              color: takeover ? '#1a1a1a' : '#eee',
-              cursor: 'pointer',
-              fontSize: '12px',
-              padding: '4px 10px',
-              borderRadius: 6,
+          'div',
+          { style: { display: 'flex', gap: 6 } },
+          h(
+            'button',
+            {
+              type: 'button',
+              onClick: showWindow,
+              title: '把真实 Chrome 窗口抬到最前，并停在面板正在看的那个标签页',
+              style: {
+                border: '1px solid rgba(255,255,255,0.25)',
+                background: 'transparent',
+                color: '#eee',
+                cursor: 'pointer',
+                fontSize: '12px',
+                padding: '4px 10px',
+                borderRadius: 6,
+              },
             },
-          },
-          takeover ? '交还浏览器' : '接管浏览器',
+            '显示窗口',
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              onClick: toggleTakeover,
+              style: {
+                border: '1px solid rgba(255,255,255,0.25)',
+                background: takeover ? '#f0b429' : 'transparent',
+                color: takeover ? '#1a1a1a' : '#eee',
+                cursor: 'pointer',
+                fontSize: '12px',
+                padding: '4px 10px',
+                borderRadius: 6,
+              },
+            },
+            takeover ? '交还浏览器' : '接管浏览器',
+          ),
         ),
       )
 

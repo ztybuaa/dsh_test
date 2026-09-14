@@ -22,7 +22,13 @@ interface FrameSize {
 interface ScreencastFrame {
   data: string
   sessionId: number
-  metadata: { deviceWidth: number; deviceHeight: number }
+  metadata: {
+    deviceWidth: number
+    deviceHeight: number
+    /** CSS-pixel viewport, present on Chrome builds that support it. */
+    visibleViewportWidth?: number
+    visibleViewportHeight?: number
+  }
 }
 
 /** Downscale cap for both the screencast and the backstop screenshots. */
@@ -36,17 +42,49 @@ const MAX_FRAME_HEIGHT = 900
  * a background tab, a static document — emits nothing at all. Without this the panel
  * keeps rendering the last frame of whatever target it was attached to before, which
  * looks exactly like "switching tabs does nothing". ego-browser's CDP backend carries
- * the same backstop (`#scheduleBackstop` / `cdpBackstopIntervalMs`) for this reason.
+ * the same backstop (`#scheduleBackstop` / `cdpBackstopIntervalMs`, default 3s) for
+ * this reason. A shorter interval buys nothing — a frame is forced on every attach —
+ * and every forced frame is a full-page JPEG encode followed by a full-frame decode
+ * in the panel, which is exactly the stutter this used to cause at 1s.
  */
-const BACKSTOP_MS = 1000
+const BACKSTOP_MS = 3000
 
-/** One relayed input event posted by the client panel. */
+/**
+ * Frames written to the panel per second.
+ *
+ * `Page.startScreencast` emits in bursts — scrolling and animation can produce far
+ * more frames than the panel can decode, and because the response is a single
+ * `multipart/x-mixed-replace` body, every frame is decoded in order whether or not
+ * anyone saw it. A backlog therefore shows up as lag that outlives the gesture.
+ * ego paces this the same way (`cdpFps`): hold the newest frame, drop the ones
+ * that arrive inside the gap, and never write faster than the target rate.
+ */
+const TARGET_FPS = 20
+const FRAME_MIN_GAP_MS = 1000 / TARGET_FPS
+
+/**
+ * One relayed input event posted by the client panel.
+ *
+ * The vocabulary is ego-lite's (`InputRouter.sendInput`): semantic pointer and key
+ * events rather than Playwright-level calls, because only these can carry a buttons
+ * bitmask, a click count, modifiers, or composed text.
+ */
 interface InputEvent {
-  type: 'down' | 'move' | 'up' | 'scroll' | 'key'
+  type: 'mouseMoved' | 'mousePressed' | 'mouseReleased' | 'mouseWheel' | 'keyDown' | 'keyUp' | 'insertText'
+  /** Normalized 0..1 within the frame; scaled to the page's CSS pixels on the host. */
   x?: number
   y?: number
+  button?: 'left' | 'middle' | 'right' | 'back' | 'forward' | 'none'
+  buttons?: number
+  clickCount?: number
+  modifiers?: number
+  deltaX?: number
   deltaY?: number
   key?: string
+  code?: string
+  text?: string
+  autoRepeat?: boolean
+  windowsVirtualKeyCode?: number
 }
 
 /** Read a JSON request body, bounding it to a sane size. */
@@ -122,16 +160,35 @@ async function streamFrames(
   let disposePage: (() => void) | undefined
   let backstop: ReturnType<typeof setInterval> | undefined
   let retry: ReturnType<typeof setTimeout> | undefined
+  let sendTimer: ReturnType<typeof setTimeout> | undefined
+  /** Newest frame not yet written; a burst collapses into this single slot. */
+  let pendingFrame: string | undefined
+  /** When a frame last ARRIVED — what the idle backstop watches. */
   let lastFrameAt = 0
+  /** When a frame was last WRITTEN — what the pacer watches. */
+  let lastSentAt = 0
   let closed = false
 
-  const pushFrame = (data: string): void => {
-    if (closed) return
+  const flushLatest = (): void => {
+    sendTimer = undefined
+    const data = pendingFrame
+    pendingFrame = undefined
+    if (data === undefined || closed) return
+    lastSentAt = Date.now()
     const buf = Buffer.from(data, 'base64')
-    lastFrameAt = Date.now()
     res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${buf.length}\r\n\r\n`)
     res.write(buf)
     res.write('\r\n')
+  }
+
+  /** Write at most one frame per FRAME_MIN_GAP_MS, and always the newest one. */
+  const queueFrame = (data: string): void => {
+    if (closed) return
+    pendingFrame = data
+    lastFrameAt = Date.now()
+    const gap = FRAME_MIN_GAP_MS - (Date.now() - lastSentAt)
+    if (gap <= 0) flushLatest()
+    else if (sendTimer === undefined) sendTimer = setTimeout(flushLatest, gap)
   }
 
   const stopBackstop = (): void => {
@@ -174,14 +231,20 @@ async function streamFrames(
         : {}),
     })
     if (closed || session !== cdp) return
-    pushFrame(shot.data)
+    queueFrame(shot.data)
   }
 
   const startBackstop = (session: CDPSession): void => {
     stopBackstop()
+    let forcing = false
     backstop = setInterval(() => {
-      if (closed || Date.now() - lastFrameAt < BACKSTOP_MS) return
-      void forceFrame(session).catch(() => {})
+      if (closed || forcing || Date.now() - lastFrameAt < BACKSTOP_MS) return
+      forcing = true
+      void forceFrame(session)
+        .catch(() => {})
+        .finally(() => {
+          forcing = false
+        })
     }, BACKSTOP_MS)
   }
 
@@ -205,7 +268,12 @@ async function streamFrames(
       session.send('Page.screencastFrameAck', { sessionId: frame.sessionId }).catch(() => {})
       // A frame from a session we have already replaced belongs to the old target.
       if (session !== cdp) return
-      pushFrame(frame.data)
+      // Prefer what Chrome reports per frame: no round trip, and never stale.
+      const vw = frame.metadata.visibleViewportWidth
+      const vh = frame.metadata.visibleViewportHeight
+      if (typeof vw === 'number' && vw > 0) frameSize.width = Math.round(vw)
+      if (typeof vh === 'number' && vh > 0) frameSize.height = Math.round(vh)
+      queueFrame(frame.data)
     })
     // Downscale to the mirror panel's size (the client <img> is ~1240px wide);
     // 1600x900 + quality 85 keeps the text crisp while staying below the
@@ -270,6 +338,7 @@ async function streamFrames(
     disposePage?.()
     stopBackstop()
     clearTimeout(retry)
+    clearTimeout(sendTimer)
     if (cdp !== undefined) {
       cdp.send('Page.stopScreencast').catch(() => {})
       cdp.detach().catch(() => {})
@@ -277,7 +346,34 @@ async function streamFrames(
   })
 }
 
-/** Relay one client input event back onto the shared page, scaling normalized coords to device pixels. */
+/**
+ * Reused CDP session for relayed input, keyed by the page it was opened for.
+ *
+ * Opening one per event would put a round trip in front of every mousemove; ego keeps
+ * a session per target for the same reason. A CDP session is bound to a single target,
+ * so this is dropped as soon as the watched page changes — for the other way a session
+ * dies, see the catch in relayInput.
+ */
+let inputCdp: { page: Page; session: CDPSession } | undefined
+
+async function inputSessionFor(page: Page): Promise<CDPSession> {
+  if (inputCdp?.page === page) return inputCdp.session
+  if (inputCdp !== undefined) await inputCdp.session.detach().catch(() => {})
+  inputCdp = { page, session: await page.context().newCDPSession(page) }
+  return inputCdp.session
+}
+
+/**
+ * Relay one human input event onto the watched page.
+ *
+ * Dispatched as raw CDP `Input.*`, which is what ego-lite's worker does. Playwright's
+ * `page.mouse` / `page.keyboard` cannot express a buttons bitmask, a click count, or
+ * composed text, so drags, double clicks, modifier combinations and any IME text
+ * (Chinese, Japanese) were either subtly wrong or simply impossible.
+ *
+ * `x`/`y` arrive normalized to the frame and are scaled here by the page's CSS
+ * viewport, which is exactly what `Input.dispatchMouseEvent` expects.
+ */
 async function relayInput(
   manager: BrowserSessionManager,
   req: IncomingMessage,
@@ -292,24 +388,64 @@ async function relayInput(
     res.end(JSON.stringify({ error: 'not in takeover — click 接管浏览器 first' }))
     return
   }
-  const mx = typeof body.x === 'number' ? body.x * frameSize.width : undefined
-  const my = typeof body.y === 'number' ? body.y * frameSize.height : undefined
   // The human operates what they SEE — the watched tab, which is not necessarily
   // the tab the agent is working on.
   const page = session.watchedPage()
+  const cdp = await inputSessionFor(page)
 
-  if (body.type === 'down' && mx !== undefined && my !== undefined) {
-    await page.mouse.move(mx, my)
-    await page.mouse.down()
-  } else if (body.type === 'move' && mx !== undefined && my !== undefined) {
-    await page.mouse.move(mx, my)
-  } else if (body.type === 'up' && mx !== undefined && my !== undefined) {
-    await page.mouse.move(mx, my)
-    await page.mouse.up()
-  } else if (body.type === 'scroll' && typeof body.deltaY === 'number') {
-    await page.mouse.wheel(0, body.deltaY)
-  } else if (body.type === 'key' && typeof body.key === 'string') {
-    await page.keyboard.press(body.key)
+  const x = typeof body.x === 'number' ? body.x * frameSize.width : 0
+  const y = typeof body.y === 'number' ? body.y * frameSize.height : 0
+  const modifiers = typeof body.modifiers === 'number' ? body.modifiers : 0
+
+  try {
+    if (body.type === 'mouseMoved') {
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, buttons: body.buttons ?? 0 })
+    } else if (body.type === 'mousePressed' || body.type === 'mouseReleased') {
+      await cdp.send('Input.dispatchMouseEvent', {
+        type: body.type,
+        x,
+        y,
+        button: body.button ?? 'left',
+        buttons: body.buttons ?? 0,
+        clickCount: body.clickCount ?? 1,
+        modifiers,
+      })
+    } else if (body.type === 'mouseWheel') {
+      await cdp.send('Input.dispatchMouseEvent', {
+        type: 'mouseWheel',
+        x,
+        y,
+        deltaX: body.deltaX ?? 0,
+        deltaY: body.deltaY ?? 0,
+      })
+    } else if (body.type === 'insertText') {
+      const text = typeof body.text === 'string' ? body.text : ''
+      if (text !== '' && text.length <= 10_000) await cdp.send('Input.insertText', { text })
+    } else if (body.type === 'keyDown' || body.type === 'keyUp') {
+      const key = typeof body.key === 'string' ? body.key.slice(0, 64) : ''
+      if (key !== '') {
+        const virtualKeyCode = Number.isInteger(body.windowsVirtualKeyCode) ? (body.windowsVirtualKeyCode ?? 0) : 0
+        await cdp.send('Input.dispatchKeyEvent', {
+          type: body.type,
+          key,
+          code: typeof body.code === 'string' ? body.code.slice(0, 64) : '',
+          modifiers,
+          autoRepeat: body.autoRepeat === true,
+          windowsVirtualKeyCode: virtualKeyCode,
+          nativeVirtualKeyCode: virtualKeyCode,
+          // Chrome derives Enter's text from the key event, but the raw CDP path has
+          // to supply it or forms never submit.
+          ...(body.type === 'keyDown' && key === 'Enter' ? { text: '\r', unmodifiedText: '\r' } : {}),
+        })
+      }
+    }
+  } catch (error) {
+    // A session bound to a page that has navigated or closed is dead. Drop it so the
+    // next event opens a fresh one instead of failing forever behind a cached handle.
+    if (inputCdp?.session === cdp) inputCdp = undefined
+    res.writeHead(500, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }))
+    return
   }
 
   res.writeHead(200, { 'content-type': 'application/json' })

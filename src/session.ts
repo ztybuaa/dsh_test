@@ -816,6 +816,17 @@ export class BrowserSessionManager {
   private readonly sessions = new WeakMap<object, BrowserSession>()
   private readonly live = new Set<BrowserSession>()
   private defaultSession: BrowserSession | undefined
+  /**
+   * Whether an agent key has already adopted the panel-started `defaultSession`.
+   *
+   * Every session shares one `--user-data-dir`, so "one more browser" is not a
+   * harmless extra window: the second Chrome finds the profile locked and its launch
+   * fails. The browser the panel starts is therefore unclaimed rather than private to
+   * the panel, and the FIRST agent key to need a session adopts it instead of
+   * launching a doomed second one. Only one may adopt it, so two different agents
+   * still end up with separate sessions.
+   */
+  private defaultSessionClaimed = false
   private recreateNotice: string | undefined
   /** The session the mirror should follow: the most recent agent-driven session. */
   private primarySession: BrowserSession | undefined
@@ -839,6 +850,14 @@ export class BrowserSessionManager {
         void existing.close() // don't orphan the old browser window/process
         this.recreateNotice = 'session was recreated (previous page lost) — navigate again'
       }
+      // Adopt the browser the panel started rather than launching a second Chrome
+      // against the same --user-data-dir, which would find the profile locked.
+      if (this.defaultSession !== undefined && !this.defaultSessionClaimed && this.defaultSession.isAlive()) {
+        this.defaultSessionClaimed = true
+        this.sessions.set(key, this.defaultSession)
+        this.setPrimary(this.defaultSession)
+        return this.defaultSession
+      }
       const created = await this.createSession()
       this.sessions.set(key, created)
       this.setPrimary(created)
@@ -854,7 +873,12 @@ export class BrowserSessionManager {
       void dead.close() // don't orphan the old browser window/process
       this.recreateNotice = 'session was recreated (previous page lost) — navigate again'
     }
-    this.defaultSession ??= await this.createSession()
+    if (this.defaultSession === undefined) {
+      this.defaultSession = await this.createSession()
+      // A browser the panel started is unclaimed, so the first agent to need one
+      // adopts it instead of launching a second Chrome against the same profile.
+      this.defaultSessionClaimed = false
+    }
     this.setPrimary(this.defaultSession)
     return this.defaultSession
   }
@@ -895,6 +919,7 @@ export class BrowserSessionManager {
     } else {
       session = this.defaultSession
       this.defaultSession = undefined
+      this.defaultSessionClaimed = false
     }
     if (session === undefined) return false
     this.live.delete(session)
@@ -908,6 +933,7 @@ export class BrowserSessionManager {
     const sessions = [...this.live]
     this.live.clear()
     this.defaultSession = undefined
+    this.defaultSessionClaimed = false
     this.primarySession = undefined
     await Promise.all(sessions.map((session) => session.close()))
   }

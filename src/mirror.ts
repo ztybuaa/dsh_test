@@ -141,6 +141,13 @@ export function registerMirrorRoutes(manager: BrowserSessionManager, webServer: 
     path: '/browser-use/show',
     handler: (_req, res) => showBrowser(manager, res),
   })
+
+  webServer.register({
+    name: 'browser-use-start',
+    kind: 'exact',
+    path: '/browser-use/start',
+    handler: (_req, res) => startBrowser(manager, res),
+  })
 }
 
 /** Stream the primary session's current page as MJPEG, following session swaps and target=_blank page rebinds. */
@@ -472,12 +479,16 @@ async function setTakeover(manager: BrowserSessionManager, req: IncomingMessage,
  * returns an empty list instead of launching a browser. Each entry carries
  * `current` (the AGENT's page) and `watched` (the PANEL's page) — two different
  * things, which is the whole point of the watch state.
+ *
+ * `hasBrowser` is reported separately from `tabs` so the panel can tell "no browser
+ * yet" apart from "a browser with no pages" — and grey out the buttons that would
+ * otherwise look broken rather than absent.
  */
 async function listTabs(manager: BrowserSessionManager, res: ServerResponse): Promise<void> {
   const session = manager.getPrimarySession()
   const tabs = session === undefined ? [] : await session.listPages()
   res.writeHead(200, { 'content-type': 'application/json' })
-  res.end(JSON.stringify({ ok: true, tabs }))
+  res.end(JSON.stringify({ ok: true, hasBrowser: session !== undefined, tabs }))
 }
 
 /**
@@ -517,11 +528,34 @@ async function showBrowser(manager: BrowserSessionManager, res: ServerResponse):
   const session = manager.getPrimarySession()
   if (session === undefined) {
     res.writeHead(404, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({ ok: false, error: 'no browser to show yet' }))
+    res.end(JSON.stringify({ ok: false, error: '还没有浏览器可以显示 —— 先让 Agent 打开一个页面' }))
     return
   }
   try {
     await session.showWindow()
+  } catch (error) {
+    res.writeHead(500, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }))
+    return
+  }
+  res.writeHead(200, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ ok: true }))
+}
+
+/**
+ * Start the browser, or hand back the one already running, so the panel has something
+ * to show before the agent has driven anything.
+ *
+ * The one place the panel may LAUNCH a browser, and it is a button rather than a side
+ * effect. It deliberately goes through the creatable session path: the manager then
+ * treats what it started as unclaimed, so the first agent that needs a session adopts
+ * it instead of launching a second Chrome against the same `--user-data-dir`, which
+ * would find the profile locked and fail. Idempotent — with a browser already up this
+ * just returns it.
+ */
+async function startBrowser(manager: BrowserSessionManager, res: ServerResponse): Promise<void> {
+  try {
+    await manager.requireSession()
   } catch (error) {
     res.writeHead(500, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }))

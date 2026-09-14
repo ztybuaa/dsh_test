@@ -20,6 +20,8 @@ window.__ModuleLoader__.load({
     var WATCH_ROUTE = '/browser-use/watch'
     /** The one deliberate exception to "observation never disturbs the browser". */
     var SHOW_ROUTE = '/browser-use/show'
+    /** Start the browser when there is none, so the panel has something to show. */
+    var START_ROUTE = '/browser-use/start'
     /** How often the strip re-reads the tab list. */
     var TABS_POLL_MS = 1500
 
@@ -75,6 +77,16 @@ window.__ModuleLoader__.load({
      */
     function showWindow() {
       return fetch(SHOW_ROUTE, { method: 'POST' })
+        .then(readFailure)
+        .catch(function (error) { return { status: 0, error: describe(error) } })
+    }
+
+    /**
+     * Start the browser. Resolves once the host has one running, so the caller can
+     * refresh the tab list and let the frame stream attach. Idempotent on the host.
+     */
+    function startBrowser() {
+      return fetch(START_ROUTE, { method: 'POST' })
         .then(readFailure)
         .catch(function (error) { return { status: 0, error: describe(error) } })
     }
@@ -227,6 +239,12 @@ window.__ModuleLoader__.load({
       var tabsState = react.useState([])
       var tabs = tabsState[0]
       var setTabs = tabsState[1]
+      // Distinct from `tabs.length === 0`: a browser can exist with no pages open. Both
+      // buttons act on the browser, so both are disabled until there is one — a button
+      // that answers "还没有浏览器" is worse than a button that is plainly unavailable.
+      var hasBrowserState = react.useState(false)
+      var hasBrowser = hasBrowserState[0]
+      var setHasBrowser = hasBrowserState[1]
       var imgRef = react.useRef(null)
       var lastMoveRef = react.useRef(0)
       var dragRef = react.useRef(null)
@@ -275,6 +293,27 @@ window.__ModuleLoader__.load({
         showWindow().then(function (failure) {
           if (failure) reportFailure(failure)
           else flashNote('已把浏览器窗口抬到最前')
+        })
+      }
+
+      /**
+       * Bring a browser into existence from the panel.
+       *
+       * The host answers only once the browser is up, so refresh the tab list straight
+       * away instead of waiting out the poll — that is what flips `hasBrowser` and lets
+       * the frame stream attach.
+       */
+      function onStartBrowser() {
+        flashNote('正在启动浏览器…')
+        startBrowser().then(function (failure) {
+          if (failure) {
+            reportFailure(failure)
+            return
+          }
+          fetch(TABS_ROUTE)
+            .then(function (res) { return res.json() })
+            .then(applyTabs)
+            .catch(function () {})
         })
       }
 
@@ -327,6 +366,13 @@ window.__ModuleLoader__.load({
       // session. That separation is what ego-lite does with CaptureManager
       // .switchTarget: viewing another tab must never steer the agent's task, nor
       // raise the real browser window.
+      /** The host's tab list, which doubles as the panel's only liveness signal. */
+      function applyTabs(body) {
+        if (!body) return
+        if (Array.isArray(body.tabs)) setTabs(body.tabs)
+        setHasBrowser(body.hasBrowser === true)
+      }
+
       react.useEffect(function () {
         if (!visible) return undefined
         var cancelled = false
@@ -334,7 +380,7 @@ window.__ModuleLoader__.load({
           fetch(TABS_ROUTE)
             .then(function (res) { return res.json() })
             .then(function (body) {
-              if (!cancelled && body && Array.isArray(body.tabs)) setTabs(body.tabs)
+              if (!cancelled) applyTabs(body)
             })
             .catch(function () {})
         }
@@ -354,7 +400,7 @@ window.__ModuleLoader__.load({
         })
           .then(function () { return fetch(TABS_ROUTE) })
           .then(function (res) { return res.json() })
-          .then(function (body) { if (body && Array.isArray(body.tabs)) setTabs(body.tabs) })
+          .then(applyTabs)
           .catch(function () {})
       }
 
@@ -449,6 +495,62 @@ window.__ModuleLoader__.load({
             font: '12px/1.5 system-ui, sans-serif',
           }
 
+      var buttonStyle = {
+        border: '1px solid rgba(255,255,255,0.25)',
+        background: 'transparent',
+        color: '#eee',
+        cursor: 'pointer',
+        fontSize: '12px',
+        padding: '4px 10px',
+        borderRadius: 6,
+      }
+
+      // With no browser there is nothing to show and nothing to take over, so the panel
+      // offers the single action that makes sense rather than two dead buttons. The host
+      // treats that browser as unclaimed, so the first agent to need one adopts it — a
+      // second Chrome on the same profile could not start anyway.
+      var actions = hasBrowser
+        ? [
+            h(
+              'button',
+              {
+                type: 'button',
+                key: 'show',
+                onClick: onShowWindow,
+                title: '把真实 Chrome 窗口抬到最前，并停在面板正在看的那个标签页',
+                style: buttonStyle,
+              },
+              '显示窗口',
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                key: 'takeover',
+                onClick: toggleTakeover,
+                title: '接管后你的点击和输入才会送进页面，Agent 的写入会被拦下',
+                style: Object.assign({}, buttonStyle, {
+                  background: takeover ? '#f0b429' : 'transparent',
+                  color: takeover ? '#1a1a1a' : '#eee',
+                }),
+              },
+              takeover ? '交还浏览器' : '接管浏览器',
+            ),
+          ]
+        : [
+            h(
+              'button',
+              {
+                type: 'button',
+                key: 'start',
+                onClick: onStartBrowser,
+                title: '启动 Agent 浏览器并在这里显示；之后 Agent 会直接用它，不会再开第二个',
+                style: Object.assign({}, buttonStyle, { background: '#f0b429', color: '#1a1a1a' }),
+              },
+              '启动浏览器',
+            ),
+          ]
+
       var bar = h(
         'div',
         {
@@ -463,45 +565,7 @@ window.__ModuleLoader__.load({
           },
         },
         h('span', { style: { fontWeight: 600 } }, takeover ? '人接管中' : 'Agent 浏览器'),
-        h(
-          'div',
-          { style: { display: 'flex', gap: 6 } },
-          h(
-            'button',
-            {
-              type: 'button',
-              onClick: onShowWindow,
-              title: '把真实 Chrome 窗口抬到最前，并停在面板正在看的那个标签页',
-              style: {
-                border: '1px solid rgba(255,255,255,0.25)',
-                background: 'transparent',
-                color: '#eee',
-                cursor: 'pointer',
-                fontSize: '12px',
-                padding: '4px 10px',
-                borderRadius: 6,
-              },
-            },
-            '显示窗口',
-          ),
-          h(
-            'button',
-            {
-              type: 'button',
-              onClick: toggleTakeover,
-              style: {
-                border: '1px solid rgba(255,255,255,0.25)',
-                background: takeover ? '#f0b429' : 'transparent',
-                color: takeover ? '#1a1a1a' : '#eee',
-                cursor: 'pointer',
-                fontSize: '12px',
-                padding: '4px 10px',
-                borderRadius: 6,
-              },
-            },
-            takeover ? '交还浏览器' : '接管浏览器',
-          ),
-        ),
+        h('div', { style: { display: 'flex', gap: 6 } }, actions),
       )
 
       // Tab strip: pins the WATCH (see the poll above). `watched` is the panel's

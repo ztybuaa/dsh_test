@@ -185,6 +185,28 @@ describe('BrowserSessionManager', () => {
     }
   })
 
+  it('lets the first agent key adopt the browser the panel started', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    try {
+      // The panel's path (no key) is the one a 「启动浏览器」 click takes.
+      const panel = await manager.requireSession()
+      expect(manager.liveSessionCount).toBe(1)
+
+      // Every session shares one --user-data-dir in production, so a second Chrome
+      // would find the profile locked. The agent must adopt, not launch.
+      const agent = await manager.requireSession({ id: 'agent-a' })
+      expect(agent).toBe(panel)
+      expect(manager.liveSessionCount).toBe(1)
+
+      // Only ONE key may adopt it — isolation between agents still holds.
+      const other = await manager.requireSession({ id: 'agent-b' })
+      expect(other).not.toBe(panel)
+      expect(manager.liveSessionCount).toBe(2)
+    } finally {
+      await manager.dispose()
+    }
+  })
+
   it('lists tabs and switches between them', async () => {
     const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
     try {

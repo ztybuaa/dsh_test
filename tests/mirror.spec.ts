@@ -90,6 +90,70 @@ async function hits(session: { page: { evaluate: (expression: string) => Promise
   return session.page.evaluate('window.__hits')
 }
 
+/** Poll until `predicate` holds; the stream attaches and paints asynchronously. */
+async function until(predicate: () => boolean, timeoutMs = 8000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  throw new Error('timed out waiting for the condition')
+}
+
+describe('frame stream', () => {
+  it('writes screencast frames as a multipart JPEG body and stops on panel close', async () => {
+    const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })
+    let closed: (() => void) | undefined
+    try {
+      const session = await manager.requireSession({ id: 'a' })
+      await session.navigate(base)
+
+      const { webServer, routes } = collectRoutes()
+      registerMirrorRoutes(manager, webServer)
+      const stream = routes.get('/browser-use/frame-stream')
+      expect(stream).toBeTypeOf('function')
+
+      const chunks: Buffer[] = []
+      const headers: Record<string, string> = {}
+      const res = {
+        writeHead(_status: number, value?: Record<string, string>) {
+          Object.assign(headers, value ?? {})
+          return res
+        },
+        write(chunk: Buffer | string) {
+          chunks.push(Buffer.from(chunk))
+          return true
+        },
+      } as unknown as ServerResponse
+      const req = {
+        on(event: string, listener: () => void) {
+          if (event === 'close') closed = listener
+          return req
+        },
+      } as unknown as IncomingMessage
+
+      await stream?.(req, res)
+      // The handler is fire-and-forget, so wait for the attach + first paint instead of
+      // assuming how long `newCDPSession` + `startScreencast` take.
+      await until(() => Buffer.concat(chunks).includes(Buffer.from([0xff, 0xd8])))
+
+      expect(headers['content-type']).toContain('multipart/x-mixed-replace')
+      expect(headers['content-type']).toContain('boundary=frame')
+      expect(Buffer.concat(chunks).toString('latin1')).toContain('--frame\r\nContent-Type: image/jpeg\r\n')
+
+      // Closing the panel must actually stop the stream, or the browser keeps encoding
+      // frames for a view nobody is looking at.
+      closed?.()
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      const settled = chunks.length
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      expect(chunks.length).toBe(settled)
+    } finally {
+      await manager.dispose()
+    }
+  })
+})
+
 describe('relayed input', () => {
   it('refuses input until the human holds takeover, then drives the page over CDP', async () => {
     const manager = new BrowserSessionManager({ headless: true, timeoutMs: 15000 })

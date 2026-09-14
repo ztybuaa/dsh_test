@@ -255,17 +255,29 @@ async function streamFrames(
     }, BACKSTOP_MS)
   }
 
+  /**
+   * Stop watching a target and drop its session.
+   *
+   * Focus emulation is switched off explicitly rather than left to the detach: the
+   * flag is not documented as session-scoped the way `Emulation.setDeviceMetricsOverride`
+   * is, so relying on the teardown to clear it would be a guess. That also means the
+   * three calls have to run in order, which is why this is awaited.
+   */
+  const release = async (session: CDPSession): Promise<void> => {
+    await session.send('Emulation.setFocusEmulationEnabled', { enabled: false }).catch(() => {})
+    await session.send('Page.stopScreencast').catch(() => {})
+    await session.detach().catch(() => {})
+  }
+
   const attach = async (page: Page): Promise<void> => {
     if (closed) return
     stopBackstop()
-    if (cdp !== undefined) {
-      cdp.send('Page.stopScreencast').catch(() => {})
-      cdp.detach().catch(() => {})
-      cdp = undefined
-    }
+    const previous = cdp
+    cdp = undefined
+    if (previous !== undefined) await release(previous)
     const session = await page.context().newCDPSession(page)
     if (closed) {
-      session.detach().catch(() => {})
+      await release(session)
       return
     }
     cdp = session
@@ -292,6 +304,13 @@ async function streamFrames(
       maxWidth: MAX_FRAME_WIDTH,
       maxHeight: MAX_FRAME_HEIGHT,
     })
+    // The panel is the human's view of this page, but the real window is launched
+    // with --start-minimized and is usually behind something, so the renderer reports
+    // itself unfocused. CDP still delivers input, but everything the page gates on
+    // focus — autofocus, in-page shortcuts, editors — silently never engages. Focus
+    // emulation makes the page believe it is focused without touching the OS window,
+    // which is the only way to have both. try-works' pane does the same.
+    await session.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {})
     // `startScreencast` waits for the next paint to emit anything, so show the new
     // target now instead of whenever it happens to repaint.
     await forceFrame(session)
@@ -347,8 +366,9 @@ async function streamFrames(
     clearTimeout(retry)
     clearTimeout(sendTimer)
     if (cdp !== undefined) {
-      cdp.send('Page.stopScreencast').catch(() => {})
-      cdp.detach().catch(() => {})
+      const session = cdp
+      cdp = undefined
+      void release(session)
     }
   })
 }

@@ -24,6 +24,14 @@ window.__ModuleLoader__.load({
     var START_ROUTE = '/browser-use/start'
     /** How often the strip re-reads the tab list. */
     var TABS_POLL_MS = 1500
+    /**
+     * Pixels per wheel notch for the non-pixel `WheelEvent.deltaMode` values.
+     *
+     * A line-mode wheel reports about ±3, and dispatching that as 3 CSS pixels scrolls
+     * nothing at all. try-works' pane scales it the same way before it reaches the page.
+     */
+    var WHEEL_LINE_PX = 120
+    var WHEEL_PAGE_PX = 600
 
     /**
      * Post one input intention to the host.
@@ -328,7 +336,12 @@ window.__ModuleLoader__.load({
           e.preventDefault()
           e.stopPropagation()
           var p = norm(e)
-          postInput({ type: 'mouseWheel', x: p.x, y: p.y, deltaX: e.deltaX || 0, deltaY: e.deltaY || 0 }, reportFailure)
+          // deltaMode 0 = pixels, 1 = lines, 2 = pages.
+          var step = e.deltaMode === 1 ? WHEEL_LINE_PX : e.deltaMode === 2 ? WHEEL_PAGE_PX : 1
+          postInput(
+            { type: 'mouseWheel', x: p.x, y: p.y, deltaX: (e.deltaX || 0) * step, deltaY: (e.deltaY || 0) * step },
+            reportFailure,
+          )
         }
         el.addEventListener('wheel', onWheel, { passive: false })
         return function () { el.removeEventListener('wheel', onWheel) }
